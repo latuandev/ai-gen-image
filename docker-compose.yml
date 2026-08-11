@@ -1,0 +1,23 @@
+services:
+  api:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+  db:
+    image: postgres:18.4-bookworm
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

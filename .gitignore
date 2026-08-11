@@ -1,0 +1,27 @@
+# Environment
+.env
+.env.*
+!*.example
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Django
+staticfiles/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+__MACOSX
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/

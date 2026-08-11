@@ -1,0 +1,22 @@
+services:
+  api:
+    build:
+      target: development
+    env_file:
+      - .env
+    ports:
+      - "${API_PORT:-127.0.0.1:8000}:8000"
+    volumes:
+      - .:/app
+    command:
+      [
+        "gunicorn",
+        "core.wsgi:application",
+        "--config",
+        "gunicorn.conf.py"
+      ]
+  db:
+    env_file:
+      - .env
+    ports:
+      - "${DB_PORT:-127.0.0.1:5432}:5432"
