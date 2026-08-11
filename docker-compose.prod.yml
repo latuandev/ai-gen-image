@@ -1,0 +1,23 @@
+services:
+  api:
+    build:
+      target: production
+    env_file:
+      - .env
+    ports:
+      - "${API_PORT:-127.0.0.1:8000}:8000"
+    command:
+      [
+        "gunicorn",
+        "core.wsgi:application",
+        "--config",
+        "gunicorn.conf.py"
+      ]
+    restart: unless-stopped
+
+  db:
+    env_file:
+      - .env
+    restart: unless-stopped
+    ports:
+      - "${DB_PORT:-127.0.0.1:5432}:5432"
