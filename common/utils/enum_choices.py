@@ -38,9 +38,7 @@ class EnumChoices(Enum):
         if not_values is None:
             not_values = []
 
-        choices = [
-            choice.value for choice in cls if choice.value not in not_values
-        ]
+        choices = [choice.value for choice in cls if choice.value not in not_values]
 
         return random.choice(choices)
 
