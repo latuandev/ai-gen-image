@@ -28,21 +28,23 @@ Do not introduce a different Django app layout without a clear architectural rea
 
 ## Domain Boundaries
 
-Domain-specific code MUST remain inside its owning `apps/<domain>/` package unless it is genuinely reusable across multiple domains.
+Domain-specific code MUST remain inside its owning `apps/<domain>/` package unless it is genuinely reusable across multiple domains or explicitly governed by a repository-wide convention.
 
 Examples of domain-specific code include:
 
-* models
-* services
-* serializers
-* tasks
-* views
+* Models
+* Services
+* Serializers
+* Tasks
+* Views
 * Domain-specific validation
 * Domain-specific infrastructure
 
 Do not move code into the top-level `common/` package merely because it is used by multiple modules inside the same domain.
 
-Shared code belongs in `common/` only when it is genuinely reusable across multiple domains or represents project-wide infrastructure.
+Shared code belongs in `common/` only when it is genuinely reusable across multiple domains, represents project-wide infrastructure, or is explicitly required there by another repository-wide convention.
+
+Project-defined choice enums and constants are intentional repository-wide exceptions and MUST follow the rules defined in the `Model Choices` section.
 
 ## Django Conventions
 
@@ -84,14 +86,14 @@ choices=Status.choices()
 Choice enums MUST be placed within the `common/constants.py` file under the following section:
 ```text
 # --------------------------------|
-# Session for Class choice enums. |
+# Section for Class choice enums. |
 # --------------------------------|
 ```
 
 Do NOT use domain-level constants. Constants that are not choice enums should be placed after the following section:
 ```text
 # -------------------------|
-# Session for constants. |
+# Section for constants.   |
 # -------------------------|
 ```
 

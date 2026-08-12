@@ -11,10 +11,10 @@ def env_bool(name: str, default: bool = False):
         return default
 
     return value.lower() in {
-        '1',
-        'true',
-        'yes',
-        'on',
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -24,8 +24,4 @@ def env_list(name: str, default: str = ""):
     """
     value = os.getenv(name, default)
 
-    return [
-        item.strip()
-        for item in value.split(",")
-        if item.strip()
-    ]
+    return [item.strip() for item in value.split(",") if item.strip()]

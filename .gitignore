@@ -25,3 +25,5 @@ __MACOSX
 .pytest_cache/
 .coverage
 htmlcov/
+
+.ruff_cache/
