@@ -1,1 +1,151 @@
-# Create your logic here.
+from uuid import UUID
+
+from django.db import transaction
+from django.utils import timezone
+
+from apps.agent_workspace.exceptions import InvalidAgentRunTransition
+from apps.agent_workspace.models import AgentRun
+from common.constants import AgentRunStatus
+
+
+def transition_agent_run(run_id: UUID | str, target_status: AgentRunStatus | str) -> AgentRun:
+    """
+    Transition an AgentRun to an explicitly allowed target status.
+
+    The run is locked within a database transaction before validating and
+    applying the status update and lifecycle timestamp changes.
+
+    Raises:
+        AgentRun.DoesNotExist: If no run exists for the provided identifier.
+        InvalidAgentRunTransition: If the requested transition is not allowed.
+    """
+
+    target_status_value = _status_value(target_status)
+
+    with transaction.atomic():
+        agent_run = _lock_agent_run(run_id)
+        now = timezone.now()
+
+        return _apply_transition(agent_run, target_status_value, now)
+
+
+def request_agent_run_cancellation(run_id: UUID | str) -> AgentRun:
+    """
+    Request cancellation for an AgentRun according to lifecycle semantics.
+
+    Queued runs move directly to CANCELLED. Running runs keep RUNNING status
+    and record the first cancellation request timestamp without overwriting it.
+
+    Raises:
+        AgentRun.DoesNotExist: If no run exists for the provided identifier.
+        InvalidAgentRunTransition: If the run cannot accept cancellation.
+    """
+
+    with transaction.atomic():
+        agent_run = _lock_agent_run(run_id)
+        now = timezone.now()
+
+        if agent_run.status == AgentRunStatus.QUEUED.value:
+            return _apply_transition(agent_run, AgentRunStatus.CANCELLED.value, now)
+
+        if agent_run.status == AgentRunStatus.RUNNING.value:
+            if agent_run.cancel_requested_at is None:
+                agent_run.cancel_requested_at = now
+                agent_run.save(update_fields=["cancel_requested_at"])
+
+            return agent_run
+
+        raise InvalidAgentRunTransition(
+            agent_run.status,
+            AgentRunStatus.CANCELLED.value,
+            agent_run.id,
+        )
+
+
+def _lock_agent_run(run_id: UUID | str) -> AgentRun:
+    """
+    Return an AgentRun locked for update in the current transaction.
+    """
+
+    return AgentRun.objects.select_for_update().get(id=run_id)
+
+
+def _apply_transition(agent_run: AgentRun, target_status: str, transition_time) -> AgentRun:
+    """
+    Apply a validated status transition and matching lifecycle timestamp.
+    """
+
+    _validate_transition(agent_run.status, target_status, agent_run.id)
+
+    update_fields = ["status"]
+    agent_run.status = target_status
+
+    timestamp_field = _timestamp_field_for_transition(target_status)
+    if timestamp_field is not None:
+        setattr(agent_run, timestamp_field, transition_time)
+        update_fields.append(timestamp_field)
+
+    agent_run.save(update_fields=update_fields)
+
+    return agent_run
+
+
+def _validate_transition(source_status: str, target_status: str, run_id: UUID) -> None:
+    """
+    Validate a status transition against the explicit transition map.
+    """
+
+    transition_map = {
+        AgentRunStatus.CREATED.value: frozenset({AgentRunStatus.QUEUED.value}),
+        AgentRunStatus.QUEUED.value: frozenset(
+            {
+                AgentRunStatus.RUNNING.value,
+                AgentRunStatus.CANCELLED.value,
+            }
+        ),
+        AgentRunStatus.RUNNING.value: frozenset(
+            {
+                AgentRunStatus.SUCCEEDED.value,
+                AgentRunStatus.FAILED.value,
+                AgentRunStatus.TIMED_OUT.value,
+                AgentRunStatus.CANCELLED.value,
+            }
+        ),
+        AgentRunStatus.SUCCEEDED.value: frozenset(),
+        AgentRunStatus.FAILED.value: frozenset(),
+        AgentRunStatus.TIMED_OUT.value: frozenset(),
+        AgentRunStatus.CANCELLED.value: frozenset(),
+    }
+
+    allowed_targets = transition_map.get(source_status, frozenset())
+
+    if target_status not in allowed_targets:
+        raise InvalidAgentRunTransition(source_status, target_status, run_id)
+
+
+def _timestamp_field_for_transition(target_status: str) -> str | None:
+    """
+    Return the lifecycle timestamp field updated by the target status.
+    """
+
+    timestamp_fields = {
+        AgentRunStatus.QUEUED.value: "queued_at",
+        AgentRunStatus.RUNNING.value: "started_at",
+        AgentRunStatus.SUCCEEDED.value: "finished_at",
+        AgentRunStatus.FAILED.value: "finished_at",
+        AgentRunStatus.TIMED_OUT.value: "finished_at",
+        AgentRunStatus.CANCELLED.value: "finished_at",
+    }
+
+    return timestamp_fields.get(target_status)
+
+
+def _status_value(status: AgentRunStatus | str) -> str:
+    """
+    Return the string value for an AgentRun status enum or raw status.
+    """
+
+    if isinstance(status, AgentRunStatus):
+        return status.value
+
+    return status
