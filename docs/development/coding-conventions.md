@@ -46,6 +46,26 @@ Shared code belongs in `common/` only when it is genuinely reusable across multi
 
 Project-defined choice enums and constants are intentional repository-wide exceptions and MUST follow the rules defined in the `Model Choices` section.
 
+## Domain Exceptions
+
+Domain-specific exceptions MUST be defined in the owning app's `exceptions.py`
+module when they represent a domain contract, service failure, validation
+outcome, or deterministic error condition that callers may catch.
+
+For example:
+
+```text
+apps/<domain>/exceptions.py
+```
+
+Do not place domain-specific exceptions in `common/exceptions.py`.
+
+Shared exceptions belong in `common/exceptions.py` only when they are genuinely
+reusable across multiple domains or represent project-wide infrastructure.
+
+Services SHOULD import and raise domain exceptions from their owning app's
+`exceptions.py` instead of defining catchable domain exceptions inline.
+
 ## Django Conventions
 
 * Keep views thin.
