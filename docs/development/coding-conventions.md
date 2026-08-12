@@ -160,6 +160,66 @@ Avoid:
 * Broad exception handling that silently suppresses failures
 * Unrelated refactoring during a scoped implementation task
 
+## Docstrings
+
+Project-owned classes, functions, and methods SHOULD include docstrings when they define a meaningful responsibility, behavior, contract, or reusable interface.
+
+Public classes, service functions, reusable utilities, and non-trivial methods MUST include docstrings.
+
+Docstrings MUST:
+
+* Be written in English
+* Follow PEP 257 conventions unless overridden by this repository style
+* Use multi-line triple-quoted formatting, even for short docstrings
+* Place the opening and closing triple quotes on their own lines
+* Describe the purpose and behavior of the class, function, or method
+* Document important arguments, return values, raised exceptions, side effects, or transactional behavior when they are not obvious from the signature
+* Remain concise and avoid repeating information already clear from names and type hints
+
+Use this format:
+
+```text
+class AgentRun(models.Model):
+    """
+    Represent a persisted end-user agent execution lifecycle.
+    """
+```
+
+For functions and methods:
+
+```text
+def generate_context_hash(files: list[Path]) -> str:
+    """
+    Generate a deterministic SHA-256 hash for the provided context files.
+    """
+```
+
+Use additional paragraphs when the behavior or contract requires more explanation.
+
+Example:
+
+```text
+def transition_agent_run(run_id: UUID, target_status: str) -> AgentRun:
+    """
+    Transition an AgentRun to an allowed target status.
+
+    The run is locked within a database transaction before validating and
+    applying the state transition.
+
+    Raises:
+        InvalidAgentRunTransition: If the requested transition is not allowed.
+    """
+```
+
+Do not use single-line docstrings such as:
+
+```text
+def generate_context_hash(files: list[Path]) -> str:
+    """Generate a deterministic SHA-256 hash for the provided context files."""
+```
+
+Generated migrations, and standard framework boilerplate MAY omit docstrings when the behavior is already self-explanatory.
+
 ## Services
 
 Application workflows SHOULD be implemented in the owning domain's `services/` package.
@@ -246,6 +306,7 @@ python -m compileall apps common core
 ruff check .
 ruff format --check .
 python manage.py check
+python manage.py makemigrations --check
 python manage.py test
 ```
 
