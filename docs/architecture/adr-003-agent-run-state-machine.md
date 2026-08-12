@@ -306,7 +306,7 @@ Execution confirmed terminated
 
 if the infrastructure requires asynchronous termination.
 
-The final terminal state becomes `CANCELLED` only when execution has actually stopped or has been safely invalidated by the runtime.
+A cancellation request does not require a dedicated `CANCEL_REQUESTED` execution state. While a running execution is being terminated, the AgentRun may remain `RUNNING` with cancel_requested_at populated. The terminal state becomes `CANCELLED` only after the execution has actually stopped or has been safely invalidated. Both user-initiated and system-initiated intentional cancellation may result in `CANCELLED`; their origin should be represented as metadata when required.
 
 ## Timeouts
 
