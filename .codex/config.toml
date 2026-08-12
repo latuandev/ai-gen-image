@@ -1,0 +1,13 @@
+# Developer-only Codex configuration for ai_gen_image.
+# End-user Agent executions MUST use a separate Codex configuration.
+
+approval_policy = "on-request"
+sandbox_mode = "workspace-write"
+
+model_reasoning_effort = "high"
+web_search = "cached"
+
+allow_login_shell = false
+
+[sandbox_workspace_write]
+network_access = false

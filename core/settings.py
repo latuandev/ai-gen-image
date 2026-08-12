@@ -49,6 +49,7 @@ INSTALLED_APPS = [
 
     # Local
     "apps.common",
+    "apps.agent_workspace",
 ]
 
 MIDDLEWARE = [
