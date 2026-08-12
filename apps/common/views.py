@@ -7,6 +7,7 @@ class ApiRootView(BaseAPIView):
     """
     Expose API metadata and discoverable shared endpoints.
     """
+
     authentication_classes = []
     permission_classes = []
 
@@ -16,10 +17,10 @@ class ApiRootView(BaseAPIView):
         """
         return self.response(
             {
-                'name': 'AI Gen Image',
-                'version': 'v1',
-                'endpoints': {
-                    'health': '/api/v1/health/',
+                "name": "AI Gen Image",
+                "version": "v1",
+                "endpoints": {
+                    "health": "/api/v1/health/",
                 },
             }
         )
@@ -29,6 +30,7 @@ class HealthCheckView(BaseAPIView):
     """
     Expose a lightweight endpoint for service health checks.
     """
+
     authentication_classes = []
     permission_classes = []
 
@@ -36,13 +38,14 @@ class HealthCheckView(BaseAPIView):
         """
         Return a lightweight health status for service checks.
         """
-        return self.response({'status': 'OK'})
+        return self.response({"status": "OK"})
 
 
 class NotFoundView(BaseAPIView):
     """
     Render unmatched routes as JSON API 404 responses.
     """
+
     authentication_classes = []
     permission_classes = []
 
@@ -52,8 +55,8 @@ class NotFoundView(BaseAPIView):
         """
         return self.response(
             {
-                'detail': 'API not found',
-                'path': f"/{path or ''}",
+                "detail": "API not found",
+                "path": f"/{path or ''}",
             },
             status_code=status.HTTP_404_NOT_FOUND,
         )

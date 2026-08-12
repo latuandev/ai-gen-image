@@ -1,13 +1,15 @@
 from common.utils.enum_choices import EnumChoices
 
 # --------------------------------|
-# Session for Class choice enums. |
+# Section for Class choice enums. |
 # --------------------------------|
+
 
 class AgentRunStatus(str, EnumChoices):
     """
     Agent run status enum.
     """
+
     CREATED = "CREATED"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
@@ -18,5 +20,5 @@ class AgentRunStatus(str, EnumChoices):
 
 
 # -------------------------|
-# Session for constants.   |
+# Section for constants.   |
 # -------------------------|

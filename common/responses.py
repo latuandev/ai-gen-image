@@ -9,8 +9,11 @@ class APIResponseMixin:
     """
     Provide shared HTTP response helpers for API views and viewsets.
     """
+
     @staticmethod
-    def response(data: Any = None, status_code: int = status.HTTP_200_OK) -> Response:
+    def response(
+        data: Any = None, status_code: int = status.HTTP_200_OK
+    ) -> Response:
         """
         Return a DRF response with explicit data and HTTP status code.
         """

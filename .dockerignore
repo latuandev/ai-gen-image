@@ -19,3 +19,5 @@ __pycache__
 htmlcov
 
 staticfiles
+
+.ruff_cache/
