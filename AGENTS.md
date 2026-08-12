@@ -8,8 +8,6 @@ This is **developer-only context**.
 
 It MUST NOT be copied or exposed to end-user Agent workspaces.
 
----
-
 ## Project
 
 `ai_gen_image` is a Django/DRF application that uses Codex CLI in two separate trust domains:
@@ -19,69 +17,31 @@ It MUST NOT be copied or exposed to end-user Agent workspaces.
 
 Developer context and end-user context MUST remain separate.
 
----
+## Required References
 
-## Architecture References
+Before implementing or modifying application code, read and comply with:
 
-Architecture documentation lives under:
+`docs/development/coding-conventions.md`
 
-```text
-docs/architecture/
-```
+For AI Agent Layer changes, also read and comply with:
 
-For AI Agent Layer changes, always read:
+`docs/architecture/security-invariants.md`
 
-```text
-docs/architecture/security-invariants.md
-```
+Then read the ADRs relevant to the change under:
 
-Then read the relevant ADRs:
-
-```text
-adr-001-agent-context-boundary.md
-adr-002-agent-execution-boundary.md
-adr-003-agent-run-state-machine.md
-```
+`docs/architecture/`
 
 For security-sensitive Agent changes, also read:
 
-```text
-agent-threat-model.md
-```
+`docs/architecture/agent-threat-model.md`
 
-Accepted ADRs and security invariants are architectural constraints.
+Accepted ADRs, active security invariants, and repository coding conventions are implementation constraints.
 
-Do not silently implement behavior that contradicts them.
+If a requested change conflicts with one of them, identify the conflict before implementation rather than silently bypassing it.
 
----
+## Agent Layer Architecture
 
-## Core Agent Rules
-
-Never:
-
-* Copy root `AGENTS.md` into an end-user workspace.
-* Copy root `.codex/` into an end-user workspace.
-* Treat `cwd` as a security sandbox.
-* Expose Django source or application secrets to an end-user Agent runtime.
-* Forward the complete Django/Celery environment to Codex.
-* Interpolate user input into shell commands.
-* Invoke Codex directly from DRF views.
-* Treat Celery state as authoritative `AgentRun` state.
-* Share mutable workspaces between Agent runs.
-* Trust model-provided filesystem paths without validation.
-* Treat model refusal as proof of security isolation.
-
-Detailed requirements are defined in:
-
-```text
-docs/architecture/security-invariants.md
-```
-
----
-
-## Dependency Direction
-
-Preserve this direction:
+Preserve the intended dependency direction:
 
 ```text
 DRF API
@@ -113,116 +73,32 @@ AgentExecutionService
     → Application orchestration
 ```
 
-Do not put Codex subprocess logic directly in views or serializers.
-
----
-
-## Django Conventions
-
-* Keep views thin.
-* Keep serializers focused on validation and representation.
-* Put application workflows in services.
-* Use explicit transactions for multi-step state changes.
-* Avoid signals for core workflows when explicit service orchestration is clearer.
-* Enforce ownership for user-scoped resources.
-* Do not expose internal exceptions, paths, commands, or secrets through APIs.
-
----
-
-## Celery Conventions
-
-Celery tasks should be thin entry points.
-
-Prefer task contracts such as:
-
-```text
-execute_agent_run(run_id)
-```
-
-Workers must reload authoritative state from persistent storage.
-
-Assume tasks may be retried or delivered more than once.
-
-Agent execution must therefore be idempotent at the domain level.
-
----
-
-## Testing
-
-Changes must include tests appropriate to their architectural layer.
-
-For Agent Layer changes, consider:
-
-* State transition tests.
-* Duplicate execution tests.
-* Workspace isolation tests.
-* Path traversal tests.
-* Symlink escape tests.
-* Timeout and cancellation tests.
-* Cleanup tests.
-* Credential isolation tests.
-
-Do not weaken security tests to make an implementation pass.
-
----
-
-## File Naming
-
-Use:
-
-* Python modules/packages: `lowercase_snake_case`
-* Project-owned docs: `lowercase-kebab-case.md`
-* ADRs: `adr-NNN-short-description.md`
-
-Preserve ecosystem/tool-defined names such as:
-
-```text
-AGENTS.md
-README.md
-Dockerfile
-.gitignore
-.dockerignore
-```
-
----
+Do not put Codex subprocess or workspace-management logic directly in views or serializers.
 
 ## Development Workflow
 
 Before modifying code:
 
-1. Inspect the relevant implementation.
-2. Read applicable architecture documents.
-3. Search for existing abstractions.
-4. Identify required tests.
+1. Inspect the relevant existing implementation.
+2. Read the applicable conventions, invariants, and ADRs.
+3. Search for existing abstractions before creating new ones.
+4. Identify the tests and verification checks required by the change.
 
 During implementation:
 
-1. Keep changes scoped.
-2. Preserve architectural boundaries.
+1. Keep changes scoped to the requested task.
+2. Preserve architectural and domain boundaries.
 3. Avoid unrelated refactors.
-4. Add or update tests.
+4. Add or update appropriate tests.
 
 After implementation:
 
-1. Run relevant tests.
-2. Review migrations and configuration changes.
-3. Verify security invariants still hold.
-
----
-
-## Scope Discipline
-
-Do not perform unrelated refactors unless they are required for correctness.
-
-If you discover an unrelated issue, report it instead of silently expanding the task.
-
-If a requested implementation conflicts with an accepted ADR or security invariant, identify the conflict before proceeding.
-
----
+1. Run the repository-defined verification checks.
+2. Review migrations and configuration changes when applicable.
+3. Verify relevant architecture and security constraints still hold.
+4. Report any check that could not be executed and explain why.
 
 ## Guiding Principle
-
-Use:
 
 ```text
 Developer Agent
@@ -232,8 +108,14 @@ End-user Agent
     → Explicitly granted capabilities only
 ```
 
-Behavioral instructions define what the Agent should do.
+Behavioral instructions define what the end-user Agent should do.
 
-Runtime security defines what the Agent can do.
+Runtime security defines what the end-user Agent can do.
 
 Never confuse the two.
+
+## Communication
+
+Report task results to the developer in Vietnamese.
+
+Keep source code, identifiers, comments, configuration, and project documentation in English unless the existing file uses another convention.

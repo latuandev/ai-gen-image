@@ -137,6 +137,7 @@ created_at
 queued_at
 started_at
 finished_at
+cancel_requested_at
 
 celery_task_id
 
