@@ -66,6 +66,71 @@ reusable across multiple domains or represent project-wide infrastructure.
 Services SHOULD import and raise domain exceptions from their owning app's
 `exceptions.py` instead of defining catchable domain exceptions inline.
 
+## User-Facing Messages
+
+Human-readable messages intended to be returned through APIs and displayed to end users MUST be centralized in:
+
+```text
+common/messages.py
+```
+
+Do not hard-code end-user-facing error or validation messages directly in views, serializers, services, tasks, or domain exceptions.
+
+Messages MUST:
+
+* Be grouped first by language code
+* Be grouped second by owning app namespace
+* Use stable `lowercase_snake_case` message keys
+* Provide the same message key for every supported language
+* Contain only end-user-safe information
+* Never expose internal exception details, filesystem paths, commands, credentials, stack traces, or implementation details
+
+Use the following structure:
+
+```python
+from django.conf import settings
+
+
+# Message lookup structure: LANGUAGE_CODE -> app namespace -> stable message key.
+_MESSAGES = {
+    "en-us": {
+        "agent_workspace": {
+            "duplicate_name": "You already have an agent definition with this name.",
+        },
+    },
+    "vi": {
+        "agent_workspace": {
+            "duplicate_name": "Bạn đã có một định nghĩa agent với tên này.",
+        },
+    },
+}
+
+MESSAGES = _MESSAGES[settings.LANGUAGE_CODE]
+```
+
+Consume messages through the exported `MESSAGES` mapping:
+
+```python
+from common.messages import MESSAGES
+
+
+message = MESSAGES["agent_workspace"]["duplicate_name"]
+```
+
+Do not use Python built-in names such as `str`, `list`, or `dict` as local variable names.
+
+Domain exceptions SHOULD represent deterministic error conditions independently from their user-facing presentation text.
+
+For example:
+
+```python
+raise DuplicateAgentNameError()
+```
+
+The API-facing layer or application boundary responsible for translating that error into a response SHOULD use the corresponding message from `common.messages`.
+
+Internal logging and diagnostic messages that are not exposed to end users do NOT belong in `common/messages.py`.
+
 ## Django Conventions
 
 * Keep views thin.
