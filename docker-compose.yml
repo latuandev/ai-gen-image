@@ -11,8 +11,36 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
     networks:
       - ai_gen_image_network
+
+  # Trusted Django/Celery orchestration worker, not the end-user Agent sandbox.
+  worker:
+    container_name: ai_gen_image_worker
+    build:
+      context: .
+    command:
+      [
+        "celery",
+        "-A",
+        "core",
+        "worker",
+        "--loglevel=info"
+      ]
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+    networks:
+      - ai_gen_image_network
+
   db:
     container_name: ai_gen_image_db
     image: postgres:18.4-bookworm
@@ -23,6 +51,22 @@ services:
         [
           "CMD-SHELL",
           "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai_gen_image_network
+
+  redis:
+    container_name: ai_gen_image_redis
+    image: redis:7-alpine
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "ping"
         ]
       interval: 5s
       timeout: 5s
