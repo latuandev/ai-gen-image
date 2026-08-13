@@ -29,6 +29,73 @@ def transition_agent_run(run_id: UUID | str, target_status: AgentRunStatus | str
         return _apply_transition(agent_run, target_status_value, now)
 
 
+def queue_agent_run_for_execution(run_id: UUID | str) -> AgentRun:
+    """
+    Transition an AgentRun to QUEUED and publish execution after commit.
+
+    The Celery task receives only the stable AgentRun identifier. If broker
+    publication fails after commit, the run may remain QUEUED for later
+    operational reconciliation.
+
+    Raises:
+        AgentRun.DoesNotExist: If no run exists for the provided identifier.
+        InvalidAgentRunTransition: If the run cannot be queued.
+    """
+
+    with transaction.atomic():
+        agent_run = _lock_agent_run(run_id)
+        queued_run = _apply_transition(agent_run, AgentRunStatus.QUEUED.value, timezone.now())
+        queued_run_id = str(queued_run.id)
+
+        transaction.on_commit(lambda: _publish_agent_run_execution(queued_run_id))
+
+        return queued_run
+
+
+def claim_agent_run_for_execution(run_id: UUID | str) -> AgentRun | None:
+    """
+    Atomically claim a queued AgentRun for execution.
+
+    A queued run is locked and transitioned to RUNNING. Non-queued runs are
+    left unchanged and return None so duplicate task delivery is idempotent.
+
+    Raises:
+        AgentRun.DoesNotExist: If no run exists for the provided identifier.
+    """
+
+    with transaction.atomic():
+        agent_run = _lock_agent_run(run_id)
+
+        if agent_run.status != AgentRunStatus.QUEUED.value:
+            return None
+
+        return _apply_transition(agent_run, AgentRunStatus.RUNNING.value, timezone.now())
+
+
+def complete_agent_run_execution(
+    run_id: UUID | str,
+    terminal_status: AgentRunStatus | str,
+) -> AgentRun:
+    """
+    Complete a running AgentRun with an explicit terminal status.
+
+    The run is locked before validating and writing the final terminal status.
+    Cancellation metadata is not interpreted as the terminal outcome; callers
+    must provide CANCELLED only after execution cancellation is confirmed.
+
+    Raises:
+        AgentRun.DoesNotExist: If no run exists for the provided identifier.
+        InvalidAgentRunTransition: If the final transition is not allowed.
+    """
+
+    terminal_status_value = _status_value(terminal_status)
+
+    with transaction.atomic():
+        agent_run = _lock_agent_run(run_id)
+
+        return _apply_transition(agent_run, terminal_status_value, timezone.now())
+
+
 def request_agent_run_cancellation(run_id: UUID | str) -> AgentRun:
     """
     Request cancellation for an AgentRun according to lifecycle semantics.
@@ -149,3 +216,13 @@ def _status_value(status: AgentRunStatus | str) -> str:
         return status.value
 
     return status
+
+
+def _publish_agent_run_execution(run_id: str) -> None:
+    """
+    Publish an AgentRun execution task with only the run identifier payload.
+    """
+
+    from apps.agent_workspace.tasks import execute_agent_run
+
+    execute_agent_run.delay(run_id)

@@ -144,6 +144,17 @@ REST_FRAMEWORK = {
 }
 
 
+# Celery
+# AgentRun database state is authoritative; Celery result state is ignored.
+
+CELERY_BROKER_URL = os.environ["CELERY_BROKER_URL"]
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TASK_IGNORE_RESULT = True
+CELERY_TIMEZONE = TIME_ZONE
+
+
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 

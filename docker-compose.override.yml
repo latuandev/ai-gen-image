@@ -15,6 +15,13 @@ services:
         "--config",
         "gunicorn.conf.py"
       ]
+  worker:
+    build:
+      target: development
+    env_file:
+      - .env
+    volumes:
+      - .:/app
   db:
     env_file:
       - .env

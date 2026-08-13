@@ -22,3 +22,9 @@ class InvalidAgentRunTransition(Exception):
             )
 
         super().__init__(message)
+
+
+class AgentExecutionError(Exception):
+    """
+    Signal that an AgentRun execution failed inside the orchestration boundary.
+    """
