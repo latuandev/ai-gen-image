@@ -123,7 +123,7 @@ Domain exceptions SHOULD represent deterministic error conditions independently 
 
 For example:
 
-```python
+```text
 raise DuplicateAgentNameError()
 ```
 
@@ -244,6 +244,44 @@ Avoid:
 * Mutable default arguments
 * Broad exception handling that silently suppresses failures
 * Unrelated refactoring during a scoped implementation task
+
+## Comments and Human-Readable Messages
+
+Sentence-like comments and human-readable message strings MUST begin with an uppercase letter.
+
+This rule applies to:
+
+* Code comments
+* Exception messages
+* Validation messages
+* Log messages
+* User-facing messages
+* Other sentence-like human-readable text embedded in source code
+
+Use:
+
+```text
+# Load and validate the context manifest.
+raise InvalidContextManifest("Manifest file cannot be read")
+logger.warning("Agent workspace cleanup failed")
+```
+
+Do not use:
+
+```text
+# load and validate the context manifest.
+raise InvalidContextManifest("manifest file cannot be read")
+logger.warning("agent workspace cleanup failed")
+```
+
+Stable identifiers, message keys, field names, paths, commands, and other non-sentence values are excluded from this rule.
+
+For example:
+
+```text
+MESSAGES["agent_workspace"]["duplicate_name"]
+error_code = "invalid_context_manifest"
+```
 
 ## Docstrings
 
