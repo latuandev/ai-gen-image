@@ -80,6 +80,11 @@ The workspace SHALL NOT be derived directly from user-controlled path input.
 
 The workspace MUST have a bounded lifecycle.
 
+The workspace root itself MUST be a real, orchestration-owned directory. It
+MUST NOT be a symlink, MUST NOT be writable by group or other users, and MUST
+be treated as a dedicated boundary whose direct children are managed only by
+the trusted orchestration process.
+
 Expected structure:
 
 ```text
@@ -407,6 +412,10 @@ User-controlled strings MUST NOT become shell syntax through string concatenatio
 ### INV-EXEC-010
 
 Security MUST remain effective even if the AI attempts to violate `USER_AGENTS.md`.
+
+### INV-EXEC-011
+
+The workspace root MUST be a dedicated orchestration-owned filesystem boundary.
 
 ## Rejected Alternatives
 

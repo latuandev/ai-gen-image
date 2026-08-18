@@ -23,6 +23,7 @@ Invariant IDs are stable references. Detailed context, rationale, implementation
 | `INV-EXEC-008` | Outputs MUST be collected only from explicitly approved locations.                                      | [ADR-002](adr-002-agent-execution-boundary.md) |
 | `INV-EXEC-009` | User-controlled input MUST NOT become shell syntax through command construction.                        | [ADR-002](adr-002-agent-execution-boundary.md) |
 | `INV-EXEC-010` | Security MUST remain effective even if the AI attempts to violate behavioral instructions.              | [ADR-002](adr-002-agent-execution-boundary.md) |
+| `INV-EXEC-011` | The workspace root MUST be a dedicated orchestration-owned filesystem boundary.                         | [ADR-002](adr-002-agent-execution-boundary.md) |
 | `INV-RUN-001`  | Database `AgentRun` state MUST be authoritative over Celery task state.                                 | [ADR-003](adr-003-agent-run-state-machine.md)  |
 | `INV-RUN-002`  | Only explicitly allowed `AgentRun` state transitions may occur.                                         | [ADR-003](adr-003-agent-run-state-machine.md)  |
 | `INV-RUN-003`  | Duplicate task delivery MUST NOT create duplicate concurrent executions for the same execution attempt. | [ADR-003](adr-003-agent-run-state-machine.md)  |

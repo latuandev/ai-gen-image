@@ -3,7 +3,11 @@ from uuid import UUID
 from django.db import transaction
 from django.utils import timezone
 
-from apps.agent_workspace.exceptions import InvalidAgentRunTransition
+from apps.agent_workspace.exceptions import (
+    AgentRunContextConflict,
+    InvalidAgentRunContextState,
+    InvalidAgentRunTransition,
+)
 from apps.agent_workspace.models import AgentRun
 from common.constants import AgentRunStatus
 
@@ -94,6 +98,50 @@ def complete_agent_run_execution(
         agent_run = _lock_agent_run(run_id)
 
         return _apply_transition(agent_run, terminal_status_value, timezone.now())
+
+
+def record_agent_run_context(
+    run_id: UUID | str,
+    context_version: str,
+    context_hash: str,
+) -> AgentRun:
+    """
+    Persist execution context audit metadata for a running AgentRun.
+
+    Existing matching metadata is treated as an idempotent retry. Existing
+    different metadata is rejected because context metadata identifies the
+    execution attempt that was actually bootstrapped.
+
+    Raises:
+        AgentRun.DoesNotExist: If no run exists for the provided identifier.
+        InvalidAgentRunContextState: If the run is not currently RUNNING.
+        AgentRunContextConflict: If different context metadata already exists.
+    """
+
+    with transaction.atomic():
+        agent_run = _lock_agent_run(run_id)
+
+        if agent_run.status != AgentRunStatus.RUNNING.value:
+            raise InvalidAgentRunContextState(agent_run.status, agent_run.id)
+
+        has_existing_context = (
+            agent_run.context_version is not None or agent_run.context_hash is not None
+        )
+        has_matching_context = (
+            agent_run.context_version == context_version and agent_run.context_hash == context_hash
+        )
+
+        if has_existing_context:
+            if has_matching_context:
+                return agent_run
+
+            raise AgentRunContextConflict(agent_run.id)
+
+        agent_run.context_version = context_version
+        agent_run.context_hash = context_hash
+        agent_run.save(update_fields=["context_version", "context_hash"])
+
+        return agent_run
 
 
 def request_agent_run_cancellation(run_id: UUID | str) -> AgentRun:

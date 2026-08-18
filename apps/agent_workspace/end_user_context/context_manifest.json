@@ -1,0 +1,13 @@
+{
+  "context_version": "end-user-context-v1",
+  "files": [
+    {
+      "source": "USER_AGENTS.md",
+      "target": "AGENTS.md"
+    },
+    {
+      "source": ".codex/config.toml",
+      "target": ".codex/config.toml"
+    }
+  ]
+}
