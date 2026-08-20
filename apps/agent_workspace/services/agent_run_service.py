@@ -177,6 +177,22 @@ def request_agent_run_cancellation(run_id: UUID | str) -> AgentRun:
         )
 
 
+def is_agent_run_cancellation_requested(run_id: UUID | str) -> bool:
+    """
+    Return whether cancellation has been requested for an AgentRun.
+
+    This read helper does not lock the row or perform state transitions, so it
+    is safe to call from a short-lived executor cancellation polling callback.
+
+    Raises:
+        AgentRun.DoesNotExist: If no run exists for the provided identifier.
+    """
+
+    return (
+        AgentRun.objects.only("cancel_requested_at").get(id=run_id).cancel_requested_at is not None
+    )
+
+
 def _lock_agent_run(run_id: UUID | str) -> AgentRun:
     """
     Return an AgentRun locked for update in the current transaction.

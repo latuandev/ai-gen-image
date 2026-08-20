@@ -131,6 +131,11 @@ The system MUST be able to terminate the full execution tree when:
 
 Killing only the direct Codex parent process is not sufficient if child processes can remain alive.
 
+The trusted local subprocess executor can terminate the direct process and live
+members that remain in the executor-owned process group. It is not a complete
+containment boundary for descendants that deliberately detach into another
+session or process group.
+
 Production execution SHOULD use an isolated runtime or sandbox capable of constraining spawned processes.
 
 ## Layer 5: Credential Isolation
@@ -287,6 +292,12 @@ SandboxedExecutor
 `LocalSubprocessExecutor` may be used for trusted development and early integration testing.
 
 It MUST NOT automatically be considered safe for untrusted public workloads.
+
+`LocalSubprocessExecutor` MUST reap the direct child process and terminate live
+members that remain in its executor-owned process group before returning a
+terminal result. Descendants that call `setsid()` or otherwise leave that
+process group require a stronger sandbox, supervisor, or runtime containment
+boundary and are outside the trusted local executor guarantee.
 
 `SandboxedExecutor` is the intended production implementation.
 

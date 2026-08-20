@@ -785,9 +785,7 @@ def _write_context_file_at(directory_fd: int, destination: str, content: bytes) 
             except FileExistsError:
                 pass
             except OSError as exc:
-                raise AgentWorkspaceError(
-                    "Context destination parent cannot be created"
-                ) from exc
+                raise AgentWorkspaceError("Context destination parent cannot be created") from exc
 
             next_parent_fd = _open_context_parent_directory(parent_fd, directory_part)
             os.close(parent_fd)

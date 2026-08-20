@@ -1,7 +1,10 @@
 import hashlib
 import json
 import os
+import signal
 import stat
+import sys
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,17 +15,39 @@ from uuid import UUID, uuid4
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ImproperlyConfigured
 from django.db import close_old_connections, connection, transaction
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 
+from apps.agent_workspace.ai_agent import cli_wrapper as cli_wrapper_module
+from apps.agent_workspace.ai_agent import executor as executor_module
+from apps.agent_workspace.ai_agent import local_subprocess_executor as local_executor_module
 from apps.agent_workspace.ai_agent import workspace_manager as workspace_manager_module
+from apps.agent_workspace.ai_agent.cli_wrapper import (
+    CODEX_HOME_ENV_KEY,
+    CodexCLIInvocation,
+    CodexCLIWrapper,
+)
 from apps.agent_workspace.ai_agent.context_manifest import load_context_manifest
+from apps.agent_workspace.ai_agent.executor import (
+    AgentExecutionOutcome,
+    AgentExecutionRequest,
+    AgentExecutionResult,
+    AgentExecutor,
+)
+from apps.agent_workspace.ai_agent.local_subprocess_executor import (
+    STDERR_LOG_FILENAME,
+    STDOUT_LOG_FILENAME,
+    LocalSubprocessExecutor,
+)
 from apps.agent_workspace.ai_agent.workspace_manager import WorkspaceManager
 from apps.agent_workspace.exceptions import (
     AgentExecutionError,
+    AgentProcessSpawnError,
     AgentRunContextConflict,
     AgentWorkspaceError,
+    InvalidAgentExecutorConfiguration,
     InvalidAgentRunContextState,
     InvalidAgentRunTransition,
+    InvalidCodexCLIConfiguration,
     InvalidContextManifest,
     WorkspaceCleanupError,
     WorkspaceIdentityError,
@@ -31,6 +56,7 @@ from apps.agent_workspace.models import AgentArtifact, AgentRun
 from apps.agent_workspace.services.agent_run_service import (
     claim_agent_run_for_execution,
     complete_agent_run_execution,
+    is_agent_run_cancellation_requested,
     queue_agent_run_for_execution,
     record_agent_run_context,
     request_agent_run_cancellation,
@@ -41,6 +67,2001 @@ from apps.agent_workspace.tasks import execute_agent_run
 from common.constants import AgentRunStatus
 from common.utils.helpers import agent_workspace_root_from_env, default_agent_workspace_root
 from core.celery import app as celery_app
+
+
+class AgentExecutorContractTests(TestCase):
+    """
+    Cover Agent execution request, result, outcome, and interface contracts.
+    """
+
+    def test_execution_request_normalizes_run_id_to_canonical_uuid(self):
+        run_id = uuid4()
+
+        request = AgentExecutionRequest(
+            run_id=str(run_id).upper(),
+            workspace_path="/tmp/workspaces/example-run",
+            prompt="Generate an image.",
+        )
+
+        self.assertEqual(request.run_id, run_id)
+        self.assertIsInstance(request.run_id, UUID)
+
+    def test_execution_request_preserves_workspace_path_and_prompt(self):
+        workspace_path = Path("/tmp/workspaces/prepared-run")
+        prompt = "Create a minimal image."
+
+        request = AgentExecutionRequest(
+            run_id=uuid4(),
+            workspace_path=workspace_path,
+            prompt=prompt,
+        )
+
+        self.assertEqual(request.workspace_path, workspace_path)
+        self.assertEqual(request.prompt, prompt)
+
+    def test_execution_request_is_immutable(self):
+        request = AgentExecutionRequest(
+            run_id=uuid4(),
+            workspace_path="/tmp/workspaces/immutable-run",
+            prompt="Create an immutable request.",
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            request.prompt = "Mutate the request."
+
+    def test_execution_outcome_enum_contains_required_semantic_outcomes(self):
+        self.assertEqual(
+            set(AgentExecutionOutcome),
+            {
+                AgentExecutionOutcome.SUCCEEDED,
+                AgentExecutionOutcome.FAILED,
+                AgentExecutionOutcome.TIMED_OUT,
+                AgentExecutionOutcome.CANCELLED,
+            },
+        )
+
+    def test_execution_result_represents_success(self):
+        result = AgentExecutionResult(
+            outcome=AgentExecutionOutcome.SUCCEEDED,
+            exit_code=0,
+        )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(result.exit_code, 0)
+
+    def test_execution_result_represents_failure_with_exit_code(self):
+        result = AgentExecutionResult(
+            outcome=AgentExecutionOutcome.FAILED,
+            exit_code=1,
+        )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.FAILED)
+        self.assertEqual(result.exit_code, 1)
+
+    def test_execution_result_represents_timeout_without_exit_code(self):
+        result = AgentExecutionResult(outcome=AgentExecutionOutcome.TIMED_OUT)
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.TIMED_OUT)
+        self.assertIsNone(result.exit_code)
+
+    def test_execution_result_represents_cancellation_without_exit_code(self):
+        result = AgentExecutionResult(outcome=AgentExecutionOutcome.CANCELLED)
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.CANCELLED)
+        self.assertIsNone(result.exit_code)
+
+    def test_execution_result_is_immutable(self):
+        result = AgentExecutionResult(
+            outcome=AgentExecutionOutcome.FAILED,
+            exit_code=2,
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            result.exit_code = 3
+
+    def test_execution_result_rejects_ambiguous_success_exit_code(self):
+        with self.assertRaises(ValueError):
+            AgentExecutionResult(
+                outcome=AgentExecutionOutcome.SUCCEEDED,
+                exit_code=1,
+            )
+
+    def test_execution_result_rejects_ambiguous_failure_exit_code(self):
+        with self.assertRaises(ValueError):
+            AgentExecutionResult(
+                outcome=AgentExecutionOutcome.FAILED,
+                exit_code=0,
+            )
+
+    def test_execution_result_rejects_exit_code_for_timeout_or_cancellation(self):
+        for outcome in [
+            AgentExecutionOutcome.TIMED_OUT,
+            AgentExecutionOutcome.CANCELLED,
+        ]:
+            with self.subTest(outcome=outcome):
+                with self.assertRaises(ValueError):
+                    AgentExecutionResult(outcome=outcome, exit_code=124)
+
+    def test_executor_implementation_can_receive_request_and_return_result(self):
+        class FakeAgentExecutor(AgentExecutor):
+            """
+            Minimal test executor implementation.
+            """
+
+            def __init__(self):
+                """
+                Store the request passed to the fake executor.
+                """
+
+                self.received_request = None
+
+            def execute(
+                self,
+                request: AgentExecutionRequest,
+                *,
+                is_cancel_requested=None,
+            ) -> AgentExecutionResult:
+                """
+                Return a deterministic executor-level success result.
+                """
+
+                self.received_request = request
+                return AgentExecutionResult(
+                    outcome=AgentExecutionOutcome.SUCCEEDED,
+                    exit_code=0,
+                )
+
+        request = AgentExecutionRequest(
+            run_id=uuid4(),
+            workspace_path="/tmp/workspaces/fake-executor-run",
+            prompt="Run through the fake executor.",
+        )
+        executor = FakeAgentExecutor()
+
+        result = executor.execute(request)
+
+        self.assertIs(executor.received_request, request)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+
+    def test_executor_contract_does_not_require_agent_run_orm_instance(self):
+        request_fields = set(AgentExecutionRequest.__dataclass_fields__)
+        result_fields = set(AgentExecutionResult.__dataclass_fields__)
+
+        self.assertEqual(request_fields, {"run_id", "workspace_path", "prompt"})
+        self.assertEqual(result_fields, {"outcome", "exit_code"})
+        self.assertFalse(hasattr(executor_module, "AgentRun"))
+
+
+class CodexCLIWrapperTests(TestCase):
+    """
+    Cover Codex-specific non-interactive invocation construction.
+    """
+
+    def create_request(
+        self,
+        prompt: str = "Generate an image.",
+        workspace_path: Path | None = None,
+    ) -> AgentExecutionRequest:
+        """
+        Create a reusable Agent execution request fixture.
+        """
+
+        return AgentExecutionRequest(
+            run_id=uuid4(),
+            workspace_path=workspace_path or Path("/tmp/agent-workspaces/prepared-run"),
+            prompt=prompt,
+        )
+
+    def test_valid_request_creates_deterministic_invocation(self):
+        request = self.create_request()
+        wrapper = CodexCLIWrapper()
+
+        first_invocation = wrapper.build_invocation(request)
+        second_invocation = wrapper.build_invocation(request)
+
+        self.assertEqual(first_invocation, second_invocation)
+        self.assertIsInstance(first_invocation, CodexCLIInvocation)
+
+    def test_executable_is_first_argv_element(self):
+        invocation = CodexCLIWrapper().build_invocation(self.create_request())
+
+        self.assertEqual(invocation.argv[0], "codex")
+
+    def test_argv_is_sequence_not_shell_command_string(self):
+        invocation = CodexCLIWrapper().build_invocation(self.create_request())
+
+        self.assertIsInstance(invocation.argv, tuple)
+        self.assertNotIsInstance(invocation.argv, str)
+        self.assertFalse(hasattr(invocation, "shell"))
+
+    def test_workspace_path_becomes_invocation_cwd_and_codex_cd(self):
+        workspace_path = Path("/tmp/agent-workspaces/workspace-cwd")
+        invocation = CodexCLIWrapper().build_invocation(
+            self.create_request(workspace_path=workspace_path)
+        )
+
+        self.assertEqual(invocation.cwd, workspace_path)
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--cd") + 1],
+            str(workspace_path),
+        )
+
+    def test_user_prompt_is_transported_through_stdin(self):
+        prompt = "Create image from the user's prompt."
+        invocation = CodexCLIWrapper().build_invocation(self.create_request(prompt=prompt))
+
+        self.assertEqual(invocation.stdin_text, prompt)
+        self.assertEqual(invocation.argv[-1], "-")
+        self.assertNotIn(prompt, invocation.argv)
+
+    def test_prompt_with_shell_metacharacters_does_not_change_argv_semantics(self):
+        prompt = 'Hello $(cat /etc/passwd) `whoami`; echo unsafe && ls | cat\n"quoted"'
+        request = self.create_request(prompt=prompt)
+        wrapper = CodexCLIWrapper()
+
+        safe_invocation = wrapper.build_invocation(self.create_request(prompt="safe prompt"))
+        metacharacter_invocation = wrapper.build_invocation(request)
+
+        self.assertEqual(
+            metacharacter_invocation.argv,
+            safe_invocation.argv,
+        )
+        self.assertEqual(metacharacter_invocation.stdin_text, prompt)
+        self.assertNotIn(prompt, metacharacter_invocation.argv)
+
+    def test_invocation_is_non_interactive(self):
+        invocation = CodexCLIWrapper().build_invocation(self.create_request())
+
+        self.assertIn("exec", invocation.argv)
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--ask-for-approval") + 1],
+            "never",
+        )
+        self.assertIn("--json", invocation.argv)
+        self.assertEqual(
+            invocation.argv[invocation.argv.index("--color") + 1],
+            "never",
+        )
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", invocation.argv)
+
+    def test_developer_repository_context_path_is_not_injected(self):
+        workspace_path = Path("/tmp/agent-workspaces/no-developer-context")
+        invocation = CodexCLIWrapper().build_invocation(
+            self.create_request(workspace_path=workspace_path)
+        )
+        repository_root = Path(__file__).resolve().parents[2]
+        invocation_values = [*invocation.argv, *invocation.environment_overrides.values()]
+
+        self.assertNotIn(str(repository_root / "AGENTS.md"), invocation_values)
+        self.assertNotIn(str(repository_root / ".codex"), invocation_values)
+
+    def test_developer_home_codex_path_is_not_hard_coded(self):
+        workspace_path = Path("/tmp/agent-workspaces/no-home-codex")
+        invocation = CodexCLIWrapper().build_invocation(
+            self.create_request(workspace_path=workspace_path)
+        )
+        developer_codex_home = str(Path.home() / ".codex")
+        invocation_values = [*invocation.argv, *invocation.environment_overrides.values()]
+
+        self.assertNotIn(developer_codex_home, invocation_values)
+
+    def test_codex_environment_overrides_are_workspace_scoped(self):
+        workspace_path = Path("/tmp/agent-workspaces/workspace-codex-home")
+        invocation = CodexCLIWrapper().build_invocation(
+            self.create_request(workspace_path=workspace_path)
+        )
+
+        self.assertEqual(
+            dict(invocation.environment_overrides),
+            {
+                CODEX_HOME_ENV_KEY: str(workspace_path / ".codex"),
+            },
+        )
+
+    def test_environment_overrides_do_not_contain_worker_secrets(self):
+        invocation = CodexCLIWrapper().build_invocation(self.create_request())
+        forbidden_keys = {
+            "DATABASE_URL",
+            "REDIS_URL",
+            "DJANGO_SECRET_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        }
+
+        self.assertTrue(forbidden_keys.isdisjoint(invocation.environment_overrides))
+
+    def test_executable_configuration_override_is_used(self):
+        invocation = CodexCLIWrapper(executable="/opt/codex/bin/codex").build_invocation(
+            self.create_request()
+        )
+
+        self.assertEqual(invocation.argv[0], "/opt/codex/bin/codex")
+
+    def test_blank_executable_configuration_is_rejected(self):
+        for executable in ["", "  \t\n  "]:
+            with self.subTest(executable=executable):
+                with self.assertRaises(InvalidCodexCLIConfiguration):
+                    CodexCLIWrapper(executable=executable)
+
+    def test_null_byte_executable_configuration_is_rejected(self):
+        with self.assertRaises(InvalidCodexCLIConfiguration):
+            CodexCLIWrapper(executable="codex\x00")
+
+    def test_wrapper_does_not_mutate_input_request(self):
+        request = self.create_request(prompt="Preserve this prompt.")
+        original_values = (request.run_id, request.workspace_path, request.prompt)
+
+        CodexCLIWrapper().build_invocation(request)
+
+        self.assertEqual(
+            (request.run_id, request.workspace_path, request.prompt),
+            original_values,
+        )
+
+    def test_wrapper_does_not_access_agent_run_orm_or_state(self):
+        self.assertFalse(hasattr(cli_wrapper_module, "AgentRun"))
+        self.assertFalse(hasattr(cli_wrapper_module, "AgentRunStatus"))
+
+    def test_wrapper_runtime_implementation_does_not_import_subprocess(self):
+        self.assertFalse(hasattr(cli_wrapper_module, "subprocess"))
+
+
+class LocalSubprocessExecutorTests(TestCase):
+    """
+    Cover trusted local subprocess execution behavior.
+    """
+
+    def setUp(self):
+        """
+        Create isolated filesystem fixtures for subprocess executor tests.
+        """
+
+        self.temp_directory = TemporaryDirectory()
+        self.addCleanup(self.temp_directory.cleanup)
+        self.temp_root = Path(self.temp_directory.name).resolve()
+        self.fake_bin_path = self.temp_root / "bin"
+        self.fake_bin_path.mkdir()
+
+    def create_workspace(self, name: str = "prepared-run") -> Path:
+        """
+        Create a prepared-workspace-shaped test fixture.
+        """
+
+        workspace_path = self.temp_root / name
+        workspace_path.mkdir()
+
+        for directory_name in [
+            "inputs",
+            "outputs",
+            "runtime",
+            "logs",
+            ".codex",
+        ]:
+            (workspace_path / directory_name).mkdir()
+
+        (workspace_path / "AGENTS.md").write_text("Use the workspace only.\n", encoding="utf-8")
+
+        return workspace_path
+
+    def create_request(
+        self,
+        workspace_path: Path,
+        prompt: str = "Generate an image.",
+    ) -> AgentExecutionRequest:
+        """
+        Create a subprocess execution request fixture.
+        """
+
+        return AgentExecutionRequest(
+            run_id=uuid4(),
+            workspace_path=workspace_path,
+            prompt=prompt,
+        )
+
+    def create_fake_codex_executable(
+        self,
+        exit_code: int = 0,
+        executable_name: str = "fake-codex",
+    ) -> Path:
+        """
+        Create a deterministic executable that behaves like a short-lived CLI.
+        """
+
+        executable_path = self.fake_bin_path / executable_name
+        inspected_environment_keys = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "CELERY_BROKER_URL",
+            "CODEX_HOME",
+            "DATABASE_PASSWORD",
+            "DATABASE_URL",
+            "DJANGO_SECRET_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "HOME",
+            "LANG",
+            "PATH",
+            "POSTGRES_PASSWORD",
+            "REDIS_URL",
+            "SECRET_KEY",
+            "SENTRY_DSN",
+        ]
+        executable_path.write_text(
+            "\n".join(
+                [
+                    f"#!{sys.executable}",
+                    "import json",
+                    "import os",
+                    "import sys",
+                    f"INSPECTED_ENVIRONMENT_KEYS = {inspected_environment_keys!r}",
+                    "stdin_text = sys.stdin.read()",
+                    "payload = {",
+                    "    'argv': sys.argv,",
+                    "    'cwd': os.getcwd(),",
+                    "    'stdin': stdin_text,",
+                    "    'env': {",
+                    "        key: os.environ[key]",
+                    "        for key in INSPECTED_ENVIRONMENT_KEYS",
+                    "        if key in os.environ",
+                    "    },",
+                    "}",
+                    "print(json.dumps(payload, sort_keys=True))",
+                    "print('stdout marker')",
+                    "print('stderr marker', file=sys.stderr)",
+                    f"sys.exit({exit_code})",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        executable_path.chmod(0o700)
+
+        return executable_path
+
+    def create_lifecycle_executable(
+        self,
+        *,
+        executable_name: str,
+        exit_code: int = 0,
+        sleep_seconds: float = 0.0,
+        ignore_sigterm: bool = False,
+        spawn_child: bool = False,
+        child_pid_path: Path | None = None,
+        side_effect_path: Path | None = None,
+    ) -> Path:
+        """
+        Create a fake executable for timeout and cancellation lifecycle tests.
+        """
+
+        executable_path = self.fake_bin_path / executable_name
+        child_code = "\n".join(
+            [
+                "import signal",
+                "import sys",
+                "import time",
+                "",
+                "def handle_sigterm(signum, frame):",
+                "    sys.exit(0)",
+                "",
+                "signal.signal(signal.SIGTERM, handle_sigterm)",
+                "time.sleep(30)",
+                "",
+            ]
+        )
+        executable_path.write_text(
+            "\n".join(
+                [
+                    f"#!{sys.executable}",
+                    "import os",
+                    "import signal",
+                    "import subprocess",
+                    "import sys",
+                    "import time",
+                    f"EXIT_CODE = {exit_code!r}",
+                    f"SLEEP_SECONDS = {sleep_seconds!r}",
+                    f"IGNORE_SIGTERM = {ignore_sigterm!r}",
+                    f"SPAWN_CHILD = {spawn_child!r}",
+                    f"CHILD_PID_PATH = {str(child_pid_path) if child_pid_path else None!r}",
+                    f"SIDE_EFFECT_PATH = {str(side_effect_path) if side_effect_path else None!r}",
+                    "child_process = None",
+                    "",
+                    "def handle_sigterm(signum, frame):",
+                    "    if IGNORE_SIGTERM:",
+                    "        return",
+                    "    if child_process is not None:",
+                    "        child_process.terminate()",
+                    "        try:",
+                    "            child_process.wait(timeout=2)",
+                    "        except subprocess.TimeoutExpired:",
+                    "            child_process.kill()",
+                    "            child_process.wait()",
+                    "    sys.exit(0)",
+                    "",
+                    "signal.signal(signal.SIGTERM, handle_sigterm)",
+                    "if SPAWN_CHILD:",
+                    f"    child_code = {child_code!r}",
+                    "    child_process = subprocess.Popen([sys.executable, '-c', child_code])",
+                    "    with open(CHILD_PID_PATH, 'w', encoding='utf-8') as child_pid_file:",
+                    "        child_pid_file.write(str(child_process.pid))",
+                    "stdin_text = sys.stdin.read()",
+                    "if SIDE_EFFECT_PATH is not None:",
+                    "    with open(SIDE_EFFECT_PATH, 'w', encoding='utf-8') as side_effect_file:",
+                    "        side_effect_file.write('started\\n')",
+                    "print('started', flush=True)",
+                    "if SLEEP_SECONDS:",
+                    "    time.sleep(SLEEP_SECONDS)",
+                    "if child_process is not None:",
+                    "    child_process.terminate()",
+                    "    child_process.wait()",
+                    "sys.exit(EXIT_CODE)",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        executable_path.chmod(0o700)
+
+        return executable_path
+
+    def create_descendant_escape_executable(
+        self,
+        *,
+        executable_name: str,
+        process_metadata_path: Path,
+        exit_code: int = 0,
+        child_ignores_sigterm: bool = False,
+        parent_exits_on_sigterm: bool = False,
+    ) -> Path:
+        """
+        Create an executable whose descendant stays in the executor process group.
+        """
+
+        executable_path = self.fake_bin_path / executable_name
+        child_ready_path = process_metadata_path.with_suffix(".ready")
+        child_lines = [
+            "import os",
+            "import signal",
+            f"READY_PATH = {str(child_ready_path)!r}",
+            "",
+        ]
+
+        if child_ignores_sigterm:
+            child_lines.extend(
+                [
+                    "def handle_sigterm(signum, frame):",
+                    "    return",
+                    "",
+                    "signal.signal(signal.SIGTERM, handle_sigterm)",
+                ]
+            )
+
+        child_lines.extend(
+            [
+                "with open(READY_PATH, 'w', encoding='utf-8') as ready_file:",
+                "    ready_file.write('ready\\n')",
+                "while True:",
+                "    signal.pause()",
+                "",
+            ]
+        )
+        child_code = "\n".join(child_lines)
+        executable_path.write_text(
+            "\n".join(
+                [
+                    f"#!{sys.executable}",
+                    "import json",
+                    "import os",
+                    "import signal",
+                    "import subprocess",
+                    "import sys",
+                    "import time",
+                    f"EXIT_CODE = {exit_code!r}",
+                    f"CHILD_CODE = {child_code!r}",
+                    f"CHILD_READY_PATH = {str(child_ready_path)!r}",
+                    f"METADATA_PATH = {str(process_metadata_path)!r}",
+                    f"PARENT_EXITS_ON_SIGTERM = {parent_exits_on_sigterm!r}",
+                    "",
+                    "def handle_sigterm(signum, frame):",
+                    "    if PARENT_EXITS_ON_SIGTERM:",
+                    "        sys.exit(0)",
+                    "",
+                    "signal.signal(signal.SIGTERM, handle_sigterm)",
+                    "child_process = subprocess.Popen([sys.executable, '-c', CHILD_CODE])",
+                    "for _ in range(500):",
+                    "    if os.path.exists(CHILD_READY_PATH):",
+                    "        break",
+                    "    time.sleep(0.01)",
+                    "else:",
+                    "    sys.exit(98)",
+                    "payload = {",
+                    "    'child_pid': child_process.pid,",
+                    "    'process_group_id': os.getpgrp(),",
+                    "}",
+                    "with open(METADATA_PATH, 'w', encoding='utf-8') as metadata_file:",
+                    "    json.dump(payload, metadata_file, sort_keys=True)",
+                    "stdin_text = sys.stdin.read()",
+                    "if PARENT_EXITS_ON_SIGTERM:",
+                    "    signal.pause()",
+                    f"sys.exit({exit_code})",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        executable_path.chmod(0o700)
+
+        return executable_path
+
+    def create_detached_descendant_executable(
+        self,
+        *,
+        executable_name: str,
+        process_metadata_path: Path,
+    ) -> Path:
+        """
+        Create an executable whose child leaves the executor process group.
+        """
+
+        executable_path = self.fake_bin_path / executable_name
+        child_ready_path = process_metadata_path.with_suffix(".ready")
+        child_code = "\n".join(
+            [
+                "import os",
+                "import signal",
+                f"READY_PATH = {str(child_ready_path)!r}",
+                "with open(READY_PATH, 'w', encoding='utf-8') as ready_file:",
+                "    ready_file.write('ready\\n')",
+                "while True:",
+                "    signal.pause()",
+                "",
+            ]
+        )
+        executable_path.write_text(
+            "\n".join(
+                [
+                    f"#!{sys.executable}",
+                    "import json",
+                    "import os",
+                    "import subprocess",
+                    "import sys",
+                    "import time",
+                    f"CHILD_CODE = {child_code!r}",
+                    f"CHILD_READY_PATH = {str(child_ready_path)!r}",
+                    f"METADATA_PATH = {str(process_metadata_path)!r}",
+                    "child_process = subprocess.Popen(",
+                    "    [sys.executable, '-c', CHILD_CODE],",
+                    "    start_new_session=True,",
+                    ")",
+                    "for _ in range(500):",
+                    "    if os.path.exists(CHILD_READY_PATH):",
+                    "        break",
+                    "    time.sleep(0.01)",
+                    "else:",
+                    "    sys.exit(98)",
+                    "payload = {",
+                    "    'child_pid': child_process.pid,",
+                    "    'child_process_group_id': os.getpgid(child_process.pid),",
+                    "    'parent_process_group_id': os.getpgrp(),",
+                    "}",
+                    "with open(METADATA_PATH, 'w', encoding='utf-8') as metadata_file:",
+                    "    json.dump(payload, metadata_file, sort_keys=True)",
+                    "stdin_text = sys.stdin.read()",
+                    "sys.exit(0)",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        executable_path.chmod(0o700)
+
+        return executable_path
+
+    def create_executor(
+        self,
+        executable_path: Path | str,
+        *,
+        timeout_seconds: float = 5.0,
+        termination_grace_seconds: float = 0.5,
+        cancellation_poll_interval_seconds: float = 0.05,
+    ) -> LocalSubprocessExecutor:
+        """
+        Create a local subprocess executor using a fake Codex executable.
+        """
+
+        return LocalSubprocessExecutor(
+            cli_wrapper=CodexCLIWrapper(executable=str(executable_path)),
+            timeout_seconds=timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            cancellation_poll_interval_seconds=cancellation_poll_interval_seconds,
+        )
+
+    def read_stdout_payload(self, workspace_path: Path) -> dict:
+        """
+        Read the JSON payload written by the fake executable.
+        """
+
+        stdout_text = (workspace_path / "logs" / STDOUT_LOG_FILENAME).read_text(encoding="utf-8")
+
+        return json.loads(stdout_text.splitlines()[0])
+
+    def pid_exists(self, pid: int) -> bool:
+        """
+        Return whether a process id still exists.
+        """
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+        return True
+
+    def process_group_exists(self, process_group_id: int) -> bool:
+        """
+        Return whether a process group still exists.
+        """
+
+        try:
+            os.kill(-process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+        return True
+
+    def process_is_live(self, pid: int) -> bool:
+        """
+        Return whether a process exists and is not a zombie/dead process.
+        """
+
+        proc_root = Path("/proc")
+
+        if proc_root.is_dir():
+            process_stat = local_executor_module._read_linux_process_stat(
+                proc_root / str(pid) / "stat"
+            )
+
+            return (
+                process_stat is not None
+                and process_stat.state not in local_executor_module.NON_LIVE_PROCESS_STATES
+            )
+
+        return self.pid_exists(pid)
+
+    def process_group_has_live_members(self, process_group_id: int) -> bool:
+        """
+        Return whether a process group contains a non-zombie process.
+        """
+
+        proc_root = Path("/proc")
+
+        if proc_root.is_dir():
+            return local_executor_module._process_group_has_live_members(process_group_id)
+
+        return self.process_group_exists(process_group_id)
+
+    def cleanup_process_group_from_metadata(self, process_metadata_path: Path) -> None:
+        """
+        Kill a recorded process group if a regression assertion fails.
+        """
+
+        if not process_metadata_path.exists():
+            return
+
+        metadata = json.loads(process_metadata_path.read_text(encoding="utf-8"))
+
+        try:
+            os.killpg(metadata["process_group_id"], signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            return
+
+    def cleanup_detached_pid_from_metadata(self, process_metadata_path: Path) -> None:
+        """
+        Kill a recorded detached process if a limitation test fails.
+        """
+
+        if not process_metadata_path.exists():
+            return
+
+        metadata = json.loads(process_metadata_path.read_text(encoding="utf-8"))
+
+        try:
+            os.kill(metadata["child_pid"], signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            return
+
+    def read_process_metadata(self, process_metadata_path: Path) -> dict:
+        """
+        Read descendant process metadata written by a fake executable.
+        """
+
+        return json.loads(process_metadata_path.read_text(encoding="utf-8"))
+
+    def write_fake_proc_stat(
+        self,
+        proc_root: Path,
+        *,
+        pid: int,
+        process_group_id: int,
+        state: str,
+        comm: str = "fake process",
+    ) -> None:
+        """
+        Write a minimal Linux proc stat fixture.
+        """
+
+        process_root = proc_root / str(pid)
+        process_root.mkdir()
+        stat_fields = [
+            str(pid),
+            f"({comm})",
+            state,
+            "1",
+            str(process_group_id),
+            "1",
+            "0",
+            "0",
+        ]
+        (process_root / "stat").write_text(" ".join(stat_fields), encoding="utf-8")
+
+    def live_probe_side_effect(self, values):
+        """
+        Return a process-group live probe side effect with a stable terminal value.
+        """
+
+        remaining_values = list(values)
+        observed_values = []
+
+        def probe(process_group_id):
+            if remaining_values:
+                value = remaining_values.pop(0)
+                observed_values.append(value)
+                return value
+
+            observed_values.append(False)
+            return False
+
+        probe.observed_values = observed_values
+
+        return probe
+
+    def test_linux_process_stat_parser_handles_comm_with_spaces_and_parentheses(self):
+        process_stat = local_executor_module._parse_linux_process_stat(
+            "123 (name with ) spaces) S 1 456 1 0 0"
+        )
+
+        self.assertEqual(process_stat.state, "S")
+        self.assertEqual(process_stat.process_group_id, 456)
+
+    def test_process_group_live_member_helper_ignores_zombie_only_group(self):
+        proc_root = self.temp_root / "proc-zombie-only"
+        proc_root.mkdir()
+        self.write_fake_proc_stat(
+            proc_root,
+            pid=1001,
+            process_group_id=9001,
+            state="Z",
+        )
+
+        self.assertFalse(
+            local_executor_module._process_group_has_live_members(
+                9001,
+                proc_root=proc_root,
+            )
+        )
+
+    def test_process_group_live_member_helper_detects_non_zombie_states(self):
+        for state in ["R", "S", "D", "T"]:
+            with self.subTest(state=state):
+                proc_root = self.temp_root / f"proc-live-{state}"
+                proc_root.mkdir()
+                self.write_fake_proc_stat(
+                    proc_root,
+                    pid=1001,
+                    process_group_id=9001,
+                    state=state,
+                )
+
+                self.assertTrue(
+                    local_executor_module._process_group_has_live_members(
+                        9001,
+                        proc_root=proc_root,
+                    )
+                )
+
+    def test_process_group_live_member_helper_ignores_other_process_groups(self):
+        proc_root = self.temp_root / "proc-other-group"
+        proc_root.mkdir()
+        self.write_fake_proc_stat(
+            proc_root,
+            pid=1001,
+            process_group_id=9002,
+            state="S",
+        )
+
+        self.assertFalse(
+            local_executor_module._process_group_has_live_members(
+                9001,
+                proc_root=proc_root,
+            )
+        )
+
+    def test_process_group_live_member_helper_handles_stat_disappearance_race(self):
+        proc_root = self.temp_root / "proc-disappeared"
+        proc_root.mkdir()
+        (proc_root / "1001").mkdir()
+
+        self.assertFalse(
+            local_executor_module._process_group_has_live_members(
+                9001,
+                proc_root=proc_root,
+            )
+        )
+
+    def test_process_group_already_gone_before_signal_returns_natural_result(self):
+        workspace_path = self.create_workspace("group-gone-before-signal")
+        executable_path = self.create_fake_codex_executable(exit_code=0)
+
+        with (
+            patch(
+                "apps.agent_workspace.ai_agent.local_subprocess_executor."
+                "_process_group_has_live_members",
+                return_value=False,
+            ),
+            patch(
+                "apps.agent_workspace.ai_agent.local_subprocess_executor._signal_process_group",
+            ) as signal_process_group,
+        ):
+            result = self.create_executor(executable_path).execute(
+                self.create_request(workspace_path)
+            )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(result.exit_code, 0)
+        signal_process_group.assert_not_called()
+
+    def test_local_subprocess_executor_conforms_agent_executor(self):
+        executor = self.create_executor(self.create_fake_codex_executable())
+
+        self.assertIsInstance(executor, AgentExecutor)
+
+    def test_invalid_timeout_configuration_is_rejected(self):
+        for timeout_seconds in [0, -1, float("inf"), "not-a-number"]:
+            with self.subTest(timeout_seconds=timeout_seconds):
+                with self.assertRaises(InvalidAgentExecutorConfiguration):
+                    LocalSubprocessExecutor(timeout_seconds=timeout_seconds)
+
+    def test_invalid_grace_period_configuration_is_rejected(self):
+        for termination_grace_seconds in [-1, float("inf"), "not-a-number"]:
+            with self.subTest(termination_grace_seconds=termination_grace_seconds):
+                with self.assertRaises(InvalidAgentExecutorConfiguration):
+                    LocalSubprocessExecutor(termination_grace_seconds=termination_grace_seconds)
+
+    def test_invalid_cancellation_poll_configuration_is_rejected(self):
+        for cancellation_poll_interval_seconds in [0, -1, float("inf"), "not-a-number"]:
+            with self.subTest(
+                cancellation_poll_interval_seconds=cancellation_poll_interval_seconds
+            ):
+                with self.assertRaises(InvalidAgentExecutorConfiguration):
+                    LocalSubprocessExecutor(
+                        cancellation_poll_interval_seconds=cancellation_poll_interval_seconds
+                    )
+
+    def test_executor_uses_codex_cli_wrapper_to_build_invocation(self):
+        workspace_path = self.create_workspace("wrapper-used")
+        executable_path = self.create_fake_codex_executable()
+        request = self.create_request(workspace_path, prompt="Use injected wrapper.")
+
+        class FakeCodexCLIWrapper:
+            """
+            Build a deterministic invocation and record the received request.
+            """
+
+            def __init__(self):
+                """
+                Store wrapper call state for assertions.
+                """
+
+                self.received_request = None
+
+            def build_invocation(self, received_request):
+                """
+                Return a fake executable invocation.
+                """
+
+                self.received_request = received_request
+                return CodexCLIInvocation(
+                    argv=(str(executable_path),),
+                    cwd=workspace_path,
+                    stdin_text=received_request.prompt,
+                    environment_overrides={
+                        CODEX_HOME_ENV_KEY: str(workspace_path / ".codex"),
+                    },
+                )
+
+        cli_wrapper = FakeCodexCLIWrapper()
+        executor = LocalSubprocessExecutor(cli_wrapper=cli_wrapper)
+
+        result = executor.execute(request)
+
+        self.assertIs(cli_wrapper.received_request, request)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+
+    def test_subprocess_receives_argv_sequence_and_shell_false(self):
+        workspace_path = self.create_workspace("argv-sequence")
+        executable_path = self.create_fake_codex_executable()
+        request = self.create_request(workspace_path)
+        executor = self.create_executor(executable_path)
+        captured = {}
+
+        class FakeProcess:
+            """
+            Minimal successful Popen replacement.
+            """
+
+            pid = 999999
+            returncode = 0
+            stdin = None
+
+            def poll(self):
+                """
+                Return immediate successful completion.
+                """
+
+                return self.returncode
+
+            def wait(self):
+                """
+                Return the already completed exit code.
+                """
+
+                return self.returncode
+
+        def fake_popen(argv, **kwargs):
+            captured["argv"] = argv
+            captured["kwargs"] = kwargs
+
+            return FakeProcess()
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor.subprocess.Popen",
+            side_effect=fake_popen,
+        ):
+            result = executor.execute(request)
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertIsInstance(captured["argv"], tuple)
+        self.assertFalse(captured["kwargs"]["shell"])
+        self.assertTrue(captured["kwargs"]["start_new_session"])
+
+    def test_subprocess_cwd_is_prepared_workspace(self):
+        workspace_path = self.create_workspace("cwd")
+        executable_path = self.create_fake_codex_executable()
+
+        self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        payload = self.read_stdout_payload(workspace_path)
+        self.assertEqual(payload["cwd"], str(workspace_path))
+
+    def test_stdin_text_is_transmitted_exactly_and_eof_is_delivered(self):
+        prompt = "Line one\nline two with 'quotes' and \"double quotes\"."
+        workspace_path = self.create_workspace("stdin")
+        executable_path = self.create_fake_codex_executable()
+
+        result = self.create_executor(executable_path).execute(
+            self.create_request(workspace_path, prompt=prompt)
+        )
+
+        payload = self.read_stdout_payload(workspace_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(payload["stdin"], prompt)
+
+    def test_missing_stdin_content_uses_non_interactive_stdin(self):
+        workspace_path = self.create_workspace("stdin-none")
+        executable_path = self.create_fake_codex_executable()
+        invocation = CodexCLIInvocation(
+            argv=(str(executable_path),),
+            cwd=workspace_path,
+            stdin_text=None,
+            environment_overrides={
+                CODEX_HOME_ENV_KEY: str(workspace_path / ".codex"),
+            },
+        )
+
+        class NoStdinWrapper:
+            """
+            Return an invocation without stdin text.
+            """
+
+            def build_invocation(self, request):
+                """
+                Return the no-stdin invocation.
+                """
+
+                return invocation
+
+        result = LocalSubprocessExecutor(cli_wrapper=NoStdinWrapper()).execute(
+            self.create_request(workspace_path)
+        )
+
+        payload = self.read_stdout_payload(workspace_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(payload["stdin"], "")
+
+    def test_stdout_and_stderr_are_written_to_workspace_logs(self):
+        workspace_path = self.create_workspace("logs")
+        executable_path = self.create_fake_codex_executable()
+
+        self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        stdout_text = (workspace_path / "logs" / STDOUT_LOG_FILENAME).read_text(encoding="utf-8")
+        stderr_text = (workspace_path / "logs" / STDERR_LOG_FILENAME).read_text(encoding="utf-8")
+
+        self.assertIn("stdout marker", stdout_text)
+        self.assertNotIn("stderr marker", stdout_text)
+        self.assertIn("stderr marker", stderr_text)
+        self.assertNotIn("stdout marker", stderr_text)
+
+    def test_exit_zero_returns_succeeded_result(self):
+        workspace_path = self.create_workspace("success")
+        executable_path = self.create_fake_codex_executable(exit_code=0)
+
+        result = self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(result.exit_code, 0)
+
+    def test_non_zero_exit_returns_failed_result_with_exit_code(self):
+        workspace_path = self.create_workspace("failure")
+        executable_path = self.create_fake_codex_executable(exit_code=7)
+
+        result = self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.FAILED)
+        self.assertEqual(result.exit_code, 7)
+
+    def test_natural_success_cleans_descendant_before_returning(self):
+        workspace_path = self.create_workspace("natural-success-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="natural-success-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            exit_code=0,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            termination_grace_seconds=0.2,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(self.process_is_live(metadata["child_pid"]))
+        self.assertFalse(self.process_group_has_live_members(metadata["process_group_id"]))
+
+    def test_natural_success_returns_when_sigkill_leaves_zombie_only_group(self):
+        workspace_path = self.create_workspace("natural-success-zombie-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="natural-success-zombie-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            exit_code=0,
+            child_ignores_sigterm=True,
+        )
+
+        live_probe = self.live_probe_side_effect([True, True, True, True, False])
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor."
+            "_process_group_has_live_members",
+            side_effect=live_probe,
+        ):
+            result = self.create_executor(
+                executable_path,
+                termination_grace_seconds=0.0,
+                cancellation_poll_interval_seconds=0.02,
+            ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("child_pid", metadata)
+        self.assertIn(False, live_probe.observed_values)
+
+    def test_liveness_probe_failure_force_kills_group_after_parent_exit(self):
+        workspace_path = self.create_workspace("probe-failure-parent-exited")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="probe-failure-parent-exited-codex",
+            process_metadata_path=process_metadata_path,
+            exit_code=0,
+        )
+        injected_error = AgentExecutionError("Injected liveness probe failure.")
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor."
+            "_process_group_has_live_members",
+            side_effect=injected_error,
+        ) as live_probe:
+            with self.assertRaises(AgentExecutionError) as context:
+                self.create_executor(
+                    executable_path,
+                    termination_grace_seconds=0.05,
+                    cancellation_poll_interval_seconds=0.02,
+                ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertIs(context.exception, injected_error)
+        self.assertEqual(live_probe.call_count, 1)
+        self.assertFalse(self.process_is_live(metadata["child_pid"]))
+        self.assertFalse(self.process_group_has_live_members(metadata["process_group_id"]))
+
+    def test_natural_failure_cleans_descendant_and_preserves_exit_code(self):
+        workspace_path = self.create_workspace("natural-failure-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="natural-failure-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            exit_code=7,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            termination_grace_seconds=0.2,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.FAILED)
+        self.assertEqual(result.exit_code, 7)
+        self.assertFalse(self.process_is_live(metadata["child_pid"]))
+        self.assertFalse(self.process_group_has_live_members(metadata["process_group_id"]))
+
+    def test_natural_failure_returns_when_sigkill_leaves_zombie_only_group(self):
+        workspace_path = self.create_workspace("natural-failure-zombie-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="natural-failure-zombie-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            exit_code=7,
+            child_ignores_sigterm=True,
+        )
+
+        live_probe = self.live_probe_side_effect([True, True, True, True, False])
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor."
+            "_process_group_has_live_members",
+            side_effect=live_probe,
+        ):
+            result = self.create_executor(
+                executable_path,
+                termination_grace_seconds=0.0,
+                cancellation_poll_interval_seconds=0.02,
+            ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.FAILED)
+        self.assertEqual(result.exit_code, 7)
+        self.assertIn("child_pid", metadata)
+        self.assertIn(False, live_probe.observed_values)
+
+    def test_detached_descendant_is_outside_local_process_group_guarantee(self):
+        workspace_path = self.create_workspace("detached-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_detached_pid_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_detached_descendant_executable(
+            executable_name="detached-descendant-codex",
+            process_metadata_path=process_metadata_path,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            termination_grace_seconds=0.05,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertNotEqual(
+            metadata["child_process_group_id"],
+            metadata["parent_process_group_id"],
+        )
+        self.assertTrue(self.process_is_live(metadata["child_pid"]))
+
+    def test_executable_not_found_raises_spawn_exception(self):
+        workspace_path = self.create_workspace("missing-executable")
+        missing_executable_path = self.temp_root / "missing-codex"
+
+        with self.assertRaises(AgentProcessSpawnError):
+            self.create_executor(missing_executable_path).execute(
+                self.create_request(workspace_path)
+            )
+
+    def test_process_is_reaped_by_communicate(self):
+        workspace_path = self.create_workspace("reaped")
+        executable_path = self.create_fake_codex_executable()
+        request = self.create_request(workspace_path)
+        executor = self.create_executor(executable_path)
+        captured = {}
+
+        class FakeProcess:
+            """
+            Record process communication for reaping semantics.
+            """
+
+            pid = 999999
+            returncode = 0
+            stdin = None
+
+            def __init__(self):
+                """
+                Track whether wait was called.
+                """
+
+                self.waited = False
+
+            def poll(self):
+                """
+                Return immediate successful completion.
+                """
+
+                return self.returncode
+
+            def wait(self):
+                """
+                Mark the process as reaped.
+                """
+
+                self.waited = True
+                return self.returncode
+
+        def fake_popen(*args, **kwargs):
+            process = FakeProcess()
+            captured["process"] = process
+
+            return process
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor.subprocess.Popen",
+            side_effect=fake_popen,
+        ):
+            executor.execute(request)
+
+        self.assertTrue(captured["process"].waited)
+
+    def test_timeout_terminates_process_group_and_returns_timed_out(self):
+        workspace_path = self.create_workspace("timeout")
+        executable_path = self.create_lifecycle_executable(
+            executable_name="timeout-codex",
+            sleep_seconds=10,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=0.2,
+            termination_grace_seconds=0.2,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(self.create_request(workspace_path))
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.TIMED_OUT)
+        self.assertIsNone(result.exit_code)
+
+    def test_timeout_force_kills_process_that_ignores_sigterm(self):
+        workspace_path = self.create_workspace("timeout-force-kill")
+        executable_path = self.create_lifecycle_executable(
+            executable_name="timeout-force-codex",
+            sleep_seconds=10,
+            ignore_sigterm=True,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=0.2,
+            termination_grace_seconds=0.05,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(self.create_request(workspace_path))
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.TIMED_OUT)
+        self.assertIsNone(result.exit_code)
+
+    def test_timeout_kills_descendant_after_parent_exits_on_sigterm(self):
+        workspace_path = self.create_workspace("timeout-descendant-ignores-sigterm")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="timeout-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            child_ignores_sigterm=True,
+            parent_exits_on_sigterm=True,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=1.0,
+            termination_grace_seconds=0.05,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.TIMED_OUT)
+        self.assertIsNone(result.exit_code)
+        self.assertFalse(self.process_is_live(metadata["child_pid"]))
+        self.assertFalse(self.process_group_has_live_members(metadata["process_group_id"]))
+
+    def test_timeout_returns_when_sigkill_leaves_zombie_only_group(self):
+        workspace_path = self.create_workspace("timeout-zombie-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="timeout-zombie-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            child_ignores_sigterm=True,
+            parent_exits_on_sigterm=True,
+        )
+
+        live_probe = self.live_probe_side_effect([True, True, True, False])
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor."
+            "_process_group_has_live_members",
+            side_effect=live_probe,
+        ):
+            result = self.create_executor(
+                executable_path,
+                timeout_seconds=1.0,
+                termination_grace_seconds=0.0,
+                cancellation_poll_interval_seconds=0.02,
+            ).execute(self.create_request(workspace_path))
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.TIMED_OUT)
+        self.assertIsNone(result.exit_code)
+        self.assertIn("child_pid", metadata)
+        self.assertIn(False, live_probe.observed_values)
+
+    def test_timeout_terminates_spawned_child_process(self):
+        workspace_path = self.create_workspace("timeout-child")
+        child_pid_path = workspace_path / "runtime" / "child.pid"
+        executable_path = self.create_lifecycle_executable(
+            executable_name="timeout-child-codex",
+            sleep_seconds=10,
+            spawn_child=True,
+            child_pid_path=child_pid_path,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=1.0,
+            termination_grace_seconds=0.3,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(self.create_request(workspace_path))
+
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        self.assertEqual(result.outcome, AgentExecutionOutcome.TIMED_OUT)
+        self.assertFalse(self.process_is_live(child_pid))
+
+    def test_cancellation_callback_terminates_process_and_returns_cancelled(self):
+        workspace_path = self.create_workspace("cancel")
+        executable_path = self.create_lifecycle_executable(
+            executable_name="cancel-codex",
+            sleep_seconds=10,
+        )
+        cancellation_checks = iter([False, False, True])
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=5,
+            termination_grace_seconds=0.2,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(
+            self.create_request(workspace_path),
+            is_cancel_requested=lambda: next(cancellation_checks, True),
+        )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.CANCELLED)
+        self.assertIsNone(result.exit_code)
+
+    def test_cancellation_kills_descendant_after_parent_exits_on_sigterm(self):
+        workspace_path = self.create_workspace("cancel-descendant-ignores-sigterm")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="cancel-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            child_ignores_sigterm=True,
+            parent_exits_on_sigterm=True,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=5,
+            termination_grace_seconds=0.05,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(
+            self.create_request(workspace_path),
+            is_cancel_requested=lambda: process_metadata_path.exists(),
+        )
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.CANCELLED)
+        self.assertIsNone(result.exit_code)
+        self.assertFalse(self.process_is_live(metadata["child_pid"]))
+        self.assertFalse(self.process_group_has_live_members(metadata["process_group_id"]))
+
+    def test_cancellation_returns_when_sigkill_leaves_zombie_only_group(self):
+        workspace_path = self.create_workspace("cancel-zombie-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="cancel-zombie-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            child_ignores_sigterm=True,
+            parent_exits_on_sigterm=True,
+        )
+
+        live_probe = self.live_probe_side_effect([True, True, True, False])
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor."
+            "_process_group_has_live_members",
+            side_effect=live_probe,
+        ):
+            result = self.create_executor(
+                executable_path,
+                timeout_seconds=5.0,
+                termination_grace_seconds=0.0,
+                cancellation_poll_interval_seconds=0.02,
+            ).execute(
+                self.create_request(workspace_path),
+                is_cancel_requested=lambda: process_metadata_path.exists(),
+            )
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertEqual(result.outcome, AgentExecutionOutcome.CANCELLED)
+        self.assertIsNone(result.exit_code)
+        self.assertIn("child_pid", metadata)
+        self.assertIn(False, live_probe.observed_values)
+
+    def test_pre_spawn_cancellation_does_not_launch_process(self):
+        workspace_path = self.create_workspace("pre-spawn-cancel")
+        side_effect_path = workspace_path / "runtime" / "started.txt"
+        executable_path = self.create_lifecycle_executable(
+            executable_name="pre-spawn-cancel-codex",
+            side_effect_path=side_effect_path,
+        )
+
+        result = self.create_executor(executable_path).execute(
+            self.create_request(workspace_path),
+            is_cancel_requested=lambda: True,
+        )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.CANCELLED)
+        self.assertFalse(side_effect_path.exists())
+        self.assertFalse((workspace_path / "logs" / STDOUT_LOG_FILENAME).exists())
+
+    def test_pre_spawn_cancellation_callback_failure_raises_execution_error(self):
+        workspace_path = self.create_workspace("pre-spawn-cancel-failure")
+        side_effect_path = workspace_path / "runtime" / "started.txt"
+        executable_path = self.create_lifecycle_executable(
+            executable_name="pre-spawn-cancel-failure-codex",
+            side_effect_path=side_effect_path,
+        )
+
+        with self.assertRaises(AgentExecutionError):
+            self.create_executor(executable_path).execute(
+                self.create_request(workspace_path),
+                is_cancel_requested=lambda: (_ for _ in ()).throw(RuntimeError("Read failed.")),
+            )
+
+        self.assertFalse(side_effect_path.exists())
+
+    def test_natural_success_observed_before_cancellation_wins(self):
+        workspace_path = self.create_workspace("success-before-cancel")
+        executable_path = self.create_fake_codex_executable(exit_code=0)
+
+        result = self.create_executor(executable_path).execute(
+            self.create_request(workspace_path),
+            is_cancel_requested=lambda: False,
+        )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.SUCCEEDED)
+        self.assertEqual(result.exit_code, 0)
+
+    def test_natural_failure_observed_before_timeout_wins(self):
+        workspace_path = self.create_workspace("failure-before-timeout")
+        executable_path = self.create_fake_codex_executable(exit_code=9)
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=5,
+        ).execute(self.create_request(workspace_path))
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.FAILED)
+        self.assertEqual(result.exit_code, 9)
+
+    def test_cancellation_observed_before_timeout_decision_wins(self):
+        workspace_path = self.create_workspace("cancel-timeout-precedence")
+        executable_path = self.create_lifecycle_executable(
+            executable_name="cancel-timeout-codex",
+            sleep_seconds=10,
+        )
+        cancellation_checks = iter([False, True])
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=0.001,
+            termination_grace_seconds=0.1,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(
+            self.create_request(workspace_path),
+            is_cancel_requested=lambda: next(cancellation_checks, True),
+        )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.CANCELLED)
+
+    def test_timeout_established_before_cancellation_observed_wins(self):
+        workspace_path = self.create_workspace("timeout-cancel-precedence")
+        executable_path = self.create_lifecycle_executable(
+            executable_name="timeout-cancel-codex",
+            sleep_seconds=10,
+        )
+
+        result = self.create_executor(
+            executable_path,
+            timeout_seconds=0.001,
+            termination_grace_seconds=0.1,
+            cancellation_poll_interval_seconds=0.02,
+        ).execute(
+            self.create_request(workspace_path),
+            is_cancel_requested=lambda: False,
+        )
+
+        self.assertEqual(result.outcome, AgentExecutionOutcome.TIMED_OUT)
+
+    def test_cancellation_callback_failure_terminates_process_and_raises(self):
+        workspace_path = self.create_workspace("cancel-callback-failure")
+        executable_path = self.create_lifecycle_executable(
+            executable_name="cancel-callback-failure-codex",
+            sleep_seconds=10,
+        )
+        cancellation_checks = iter([False, RuntimeError("Database read failed.")])
+
+        def failing_cancellation_check():
+            cancellation_check = next(cancellation_checks)
+
+            if isinstance(cancellation_check, Exception):
+                raise cancellation_check
+
+            return cancellation_check
+
+        with self.assertRaises(AgentExecutionError):
+            self.create_executor(
+                executable_path,
+                timeout_seconds=5,
+                termination_grace_seconds=0.2,
+                cancellation_poll_interval_seconds=0.02,
+            ).execute(
+                self.create_request(workspace_path),
+                is_cancel_requested=failing_cancellation_check,
+            )
+
+    def test_cancellation_callback_failure_cleans_live_descendant_before_raising(self):
+        workspace_path = self.create_workspace("cancel-callback-failure-descendant")
+        process_metadata_path = workspace_path / "runtime" / "process.json"
+        self.addCleanup(
+            self.cleanup_process_group_from_metadata,
+            process_metadata_path,
+        )
+        executable_path = self.create_descendant_escape_executable(
+            executable_name="cancel-callback-failure-descendant-codex",
+            process_metadata_path=process_metadata_path,
+            child_ignores_sigterm=True,
+            parent_exits_on_sigterm=True,
+        )
+
+        def failing_cancellation_check():
+            if process_metadata_path.exists():
+                raise RuntimeError("Database read failed.")
+
+            return False
+
+        with self.assertRaises(AgentExecutionError):
+            self.create_executor(
+                executable_path,
+                timeout_seconds=5,
+                termination_grace_seconds=0.05,
+                cancellation_poll_interval_seconds=0.02,
+            ).execute(
+                self.create_request(workspace_path),
+                is_cancel_requested=failing_cancellation_check,
+            )
+
+        metadata = self.read_process_metadata(process_metadata_path)
+        self.assertFalse(self.process_is_live(metadata["child_pid"]))
+        self.assertFalse(self.process_group_has_live_members(metadata["process_group_id"]))
+
+    def test_process_group_signal_failure_raises_after_parent_reap(self):
+        workspace_path = self.create_workspace("signal-failure")
+        executable_path = self.create_lifecycle_executable(
+            executable_name="signal-failure-codex",
+            sleep_seconds=10,
+        )
+
+        with patch(
+            "apps.agent_workspace.ai_agent.local_subprocess_executor.os.killpg",
+            side_effect=OSError("Signal failed."),
+        ):
+            with self.assertRaises(AgentExecutionError):
+                self.create_executor(
+                    executable_path,
+                    timeout_seconds=0.2,
+                    termination_grace_seconds=0.1,
+                    cancellation_poll_interval_seconds=0.02,
+                ).execute(self.create_request(workspace_path))
+
+    def test_process_group_still_live_after_sigkill_raises_execution_error(self):
+        executor = self.create_executor(
+            self.create_fake_codex_executable(),
+            termination_grace_seconds=0.0,
+            cancellation_poll_interval_seconds=0.02,
+        )
+
+        class FakeProcess:
+            """
+            Minimal exited parent process for fail-closed lifecycle tests.
+            """
+
+            pid = 999999
+
+            def __init__(self):
+                """
+                Track direct parent reaping.
+                """
+
+                self.wait_count = 0
+
+            def poll(self):
+                """
+                Return exited parent state.
+                """
+
+                return 0
+
+            def wait(self):
+                """
+                Record parent reap attempts.
+                """
+
+                self.wait_count += 1
+                return 0
+
+        process = FakeProcess()
+
+        with (
+            patch(
+                "apps.agent_workspace.ai_agent.local_subprocess_executor."
+                "_process_group_has_live_members",
+                return_value=True,
+            ),
+            patch(
+                "apps.agent_workspace.ai_agent.local_subprocess_executor._signal_process_group",
+            ),
+            self.assertRaises(AgentExecutionError),
+        ):
+            executor._terminate_process_group(process, process.pid)
+
+        self.assertGreater(process.wait_count, 0)
+
+    def test_prompt_shell_metacharacters_are_not_interpreted(self):
+        prompts = [
+            "hello; touch SHOULD_NOT_EXIST",
+            "$(touch SHOULD_NOT_EXIST)",
+            "`touch SHOULD_NOT_EXIST`",
+            "hello && touch SHOULD_NOT_EXIST",
+            "hello | touch SHOULD_NOT_EXIST",
+        ]
+
+        for index, prompt in enumerate(prompts):
+            with self.subTest(prompt=prompt):
+                workspace_path = self.create_workspace(f"shell-injection-{index}")
+                executable_path = self.create_fake_codex_executable(
+                    executable_name=f"fake-codex-{index}"
+                )
+
+                self.create_executor(executable_path).execute(
+                    self.create_request(workspace_path, prompt=prompt)
+                )
+
+                payload = self.read_stdout_payload(workspace_path)
+                self.assertEqual(payload["stdin"], prompt)
+                self.assertFalse((workspace_path / "SHOULD_NOT_EXIST").exists())
+
+    def test_child_environment_does_not_inherit_worker_secrets(self):
+        workspace_path = self.create_workspace("env-secrets")
+        executable_path = self.create_fake_codex_executable()
+        parent_environment = {
+            "AWS_ACCESS_KEY_ID": "SHOULD_NOT_LEAK",
+            "AWS_SECRET_ACCESS_KEY": "SHOULD_NOT_LEAK",
+            "AWS_SESSION_TOKEN": "SHOULD_NOT_LEAK",
+            "CELERY_BROKER_URL": "SHOULD_NOT_LEAK",
+            "DATABASE_PASSWORD": "SHOULD_NOT_LEAK",
+            "DATABASE_URL": "SHOULD_NOT_LEAK",
+            "DJANGO_SECRET_KEY": "SHOULD_NOT_LEAK",
+            "GOOGLE_APPLICATION_CREDENTIALS": "SHOULD_NOT_LEAK",
+            "PATH": os.environ.get("PATH", ""),
+            "POSTGRES_PASSWORD": "SHOULD_NOT_LEAK",
+            "REDIS_URL": "SHOULD_NOT_LEAK",
+            "SECRET_KEY": "SHOULD_NOT_LEAK",
+            "SENTRY_DSN": "SHOULD_NOT_LEAK",
+        }
+
+        with patch.dict(os.environ, parent_environment, clear=True):
+            self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        payload = self.read_stdout_payload(workspace_path)
+        leaked_environment = {
+            key: value for key, value in payload["env"].items() if value == "SHOULD_NOT_LEAK"
+        }
+
+        self.assertEqual(leaked_environment, {})
+
+    def test_allowed_parent_environment_values_are_propagated(self):
+        workspace_path = self.create_workspace("env-allowlist")
+        executable_path = self.create_fake_codex_executable()
+        parent_environment = {
+            "LANG": "C.UTF-8",
+            "PATH": str(self.fake_bin_path),
+        }
+
+        with patch.dict(os.environ, parent_environment, clear=True):
+            LocalSubprocessExecutor(
+                cli_wrapper=CodexCLIWrapper(executable=executable_path.name)
+            ).execute(self.create_request(workspace_path))
+
+        payload = self.read_stdout_payload(workspace_path)
+        self.assertEqual(payload["env"]["LANG"], "C.UTF-8")
+        self.assertEqual(payload["env"]["PATH"], str(self.fake_bin_path))
+
+    def test_child_home_is_workspace_runtime_home_not_parent_home(self):
+        workspace_path = self.create_workspace("runtime-home")
+        executable_path = self.create_fake_codex_executable()
+
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/fake/developer/home",
+                "PATH": os.environ.get("PATH", ""),
+            },
+            clear=True,
+        ):
+            self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        payload = self.read_stdout_payload(workspace_path)
+        self.assertEqual(payload["env"]["HOME"], str(workspace_path / "runtime" / "home"))
+        self.assertNotEqual(payload["env"]["HOME"], "/fake/developer/home")
+
+    def test_codex_invocation_environment_overrides_are_merged(self):
+        workspace_path = self.create_workspace("codex-home")
+        executable_path = self.create_fake_codex_executable()
+
+        self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        payload = self.read_stdout_payload(workspace_path)
+        self.assertEqual(payload["env"][CODEX_HOME_ENV_KEY], str(workspace_path / ".codex"))
+
+    def test_forbidden_invocation_environment_override_is_rejected(self):
+        workspace_path = self.create_workspace("forbidden-override")
+        executable_path = self.create_fake_codex_executable()
+        invocation = CodexCLIInvocation(
+            argv=(str(executable_path),),
+            cwd=workspace_path,
+            stdin_text="Prompt.",
+            environment_overrides={
+                "DJANGO_SECRET_KEY": "SHOULD_NOT_LEAK",
+            },
+        )
+
+        class ForbiddenEnvironmentWrapper:
+            """
+            Return an invocation with a forbidden environment override.
+            """
+
+            def build_invocation(self, request):
+                """
+                Return the forbidden invocation.
+                """
+
+                return invocation
+
+        with self.assertRaises(AgentProcessSpawnError):
+            LocalSubprocessExecutor(cli_wrapper=ForbiddenEnvironmentWrapper()).execute(
+                self.create_request(workspace_path)
+            )
+
+    def test_existing_stdout_log_file_fails_safely(self):
+        workspace_path = self.create_workspace("existing-stdout")
+        executable_path = self.create_fake_codex_executable()
+        stdout_path = workspace_path / "logs" / STDOUT_LOG_FILENAME
+        stdout_path.write_text("Existing log.\n", encoding="utf-8")
+
+        with self.assertRaises(AgentProcessSpawnError):
+            self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        self.assertEqual(stdout_path.read_text(encoding="utf-8"), "Existing log.\n")
+
+    def test_log_symlink_does_not_write_outside_workspace(self):
+        workspace_path = self.create_workspace("log-symlink")
+        executable_path = self.create_fake_codex_executable()
+        outside_log_target = self.temp_root / "outside.log"
+        outside_log_target.write_text("Outside content.\n", encoding="utf-8")
+        (workspace_path / "logs" / STDOUT_LOG_FILENAME).symlink_to(outside_log_target)
+
+        with self.assertRaises(AgentProcessSpawnError):
+            self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        self.assertEqual(
+            outside_log_target.read_text(encoding="utf-8"),
+            "Outside content.\n",
+        )
+
+    def test_logs_directory_symlink_is_rejected(self):
+        workspace_path = self.create_workspace("logs-dir-symlink")
+        executable_path = self.create_fake_codex_executable()
+        outside_logs_path = self.temp_root / "outside-logs"
+        outside_logs_path.mkdir()
+        logs_path = workspace_path / "logs"
+        logs_path.rmdir()
+        logs_path.symlink_to(outside_logs_path, target_is_directory=True)
+
+        with self.assertRaises(AgentProcessSpawnError):
+            self.create_executor(executable_path).execute(self.create_request(workspace_path))
+
+        self.assertFalse((outside_logs_path / STDOUT_LOG_FILENAME).exists())
+
+    def test_executor_does_not_access_agent_run_orm_or_state(self):
+        self.assertFalse(hasattr(local_executor_module, "AgentRun"))
+        self.assertFalse(hasattr(local_executor_module, "AgentRunStatus"))
 
 
 class AgentRunModelTests(TestCase):
@@ -2008,6 +4029,15 @@ class AgentRunLifecycleServiceTests(TestCase):
         self.assertIsNotNone(cancellation_requested_run.cancel_requested_at)
         self.assertIsNone(cancellation_requested_run.finished_at)
 
+    def test_cancellation_requested_helper_reads_authoritative_state(self):
+        agent_run = self.create_running_run()
+
+        self.assertFalse(is_agent_run_cancellation_requested(agent_run.id))
+
+        request_agent_run_cancellation(agent_run.id)
+
+        self.assertTrue(is_agent_run_cancellation_requested(agent_run.id))
+
     def test_repeated_running_cancellation_does_not_overwrite_cancel_requested_at(self):
         agent_run = self.create_running_run()
         first_request_time = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -2281,8 +4311,10 @@ class AgentRunDummyExecutionTests(TestCase):
         self.addCleanup(self.temp_directory.cleanup)
         self.temp_root = Path(self.temp_directory.name).resolve()
         self.workspace_root = self.temp_root / "workspaces"
+        self.fake_bin_path = self.temp_root / "bin"
         self.context_root = self.temp_root / "end_user_context"
         self.codex_directory = self.context_root / ".codex"
+        self.fake_bin_path.mkdir()
         self.codex_directory.mkdir(parents=True)
         self.manifest_path = self.context_root / "context_manifest.json"
         self.user_agents_path = self.context_root / "USER_AGENTS.md"
@@ -2342,6 +4374,55 @@ class AgentRunDummyExecutionTests(TestCase):
         agent_run = AgentRun.objects.create(**defaults)
 
         return transition_agent_run(agent_run.id, AgentRunStatus.QUEUED)
+
+    def create_agent_lifecycle_executable(
+        self,
+        *,
+        executable_name: str = "fake-agent-codex",
+        exit_code: int = 0,
+        sleep_seconds: float = 0.0,
+        side_effect_path: Path | None = None,
+    ) -> Path:
+        """
+        Create a fake Codex executable for ExecutionService integration tests.
+        """
+
+        executable_path = self.fake_bin_path / executable_name
+        executable_path.write_text(
+            "\n".join(
+                [
+                    f"#!{sys.executable}",
+                    "import json",
+                    "import os",
+                    "import sys",
+                    "import time",
+                    f"EXIT_CODE = {exit_code!r}",
+                    f"SLEEP_SECONDS = {sleep_seconds!r}",
+                    f"SIDE_EFFECT_PATH = {str(side_effect_path) if side_effect_path else None!r}",
+                    "stdin_text = sys.stdin.read()",
+                    "payload = {",
+                    "    'argv': sys.argv,",
+                    "    'cwd': os.getcwd(),",
+                    "    'stdin': stdin_text,",
+                    "    'has_agents': os.path.exists('AGENTS.md'),",
+                    "    'has_codex_config': os.path.exists('.codex/config.toml'),",
+                    "}",
+                    "if SIDE_EFFECT_PATH is not None:",
+                    "    with open(SIDE_EFFECT_PATH, 'a', encoding='utf-8') as marker_file:",
+                    "        marker_file.write(json.dumps(payload, sort_keys=True) + '\\n')",
+                    "print('stdout marker')",
+                    "print('stderr marker', file=sys.stderr)",
+                    "if SLEEP_SECONDS:",
+                    "    time.sleep(SLEEP_SECONDS)",
+                    "sys.exit(EXIT_CODE)",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        executable_path.chmod(0o700)
+
+        return executable_path
 
     def test_successful_dummy_execution_reaches_succeeded(self):
         agent_run = self.create_queued_run()
@@ -2808,6 +4889,305 @@ class AgentRunDummyExecutionTests(TestCase):
         self.assertEqual(agent_run.status, AgentRunStatus.FAILED.value)
         self.assertIsNotNone(agent_run.cancel_requested_at)
         self.assertIsNotNone(agent_run.finished_at)
+
+    def test_local_subprocess_success_reaches_succeeded(self):
+        marker_path = self.temp_root / "local-success.jsonl"
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-success",
+            side_effect_path=marker_path,
+        )
+        agent_run = self.create_queued_run(prompt="Run local subprocess.")
+
+        with self.settings(
+            AGENT_EXECUTOR_BACKEND="local_subprocess",
+            AGENT_CODEX_EXECUTABLE=str(executable_path),
+            AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+            AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.1,
+            AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        payload = json.loads(marker_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(executed_run.status, AgentRunStatus.SUCCEEDED.value)
+        self.assertEqual(payload["stdin"], "Run local subprocess.")
+        self.assertEqual(
+            payload["cwd"], str(self.workspace_manager.get_workspace_path(agent_run.id))
+        )
+        self.assertTrue(payload["has_agents"])
+        self.assertTrue(payload["has_codex_config"])
+        self.assertFalse(self.workspace_manager.get_workspace_path(agent_run.id).exists())
+
+    def test_local_subprocess_non_zero_exit_reaches_failed(self):
+        marker_path = self.temp_root / "local-failed.jsonl"
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-failed",
+            exit_code=7,
+            side_effect_path=marker_path,
+        )
+        agent_run = self.create_queued_run()
+
+        with self.settings(
+            AGENT_EXECUTOR_BACKEND="local_subprocess",
+            AGENT_CODEX_EXECUTABLE=str(executable_path),
+            AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+            AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.1,
+            AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        self.assertEqual(executed_run.status, AgentRunStatus.FAILED.value)
+        self.assertTrue(marker_path.exists())
+        self.assertFalse(self.workspace_manager.get_workspace_path(agent_run.id).exists())
+
+    def test_local_subprocess_timeout_reaches_timed_out(self):
+        marker_path = self.temp_root / "local-timeout.jsonl"
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-timeout",
+            sleep_seconds=5.0,
+            side_effect_path=marker_path,
+        )
+        agent_run = self.create_queued_run()
+
+        with self.settings(
+            AGENT_EXECUTOR_BACKEND="local_subprocess",
+            AGENT_CODEX_EXECUTABLE=str(executable_path),
+            AGENT_EXECUTION_TIMEOUT_SECONDS=1.0,
+            AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.05,
+            AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        self.assertEqual(executed_run.status, AgentRunStatus.TIMED_OUT.value)
+        self.assertTrue(marker_path.exists())
+        self.assertFalse(self.workspace_manager.get_workspace_path(agent_run.id).exists())
+
+    def test_local_subprocess_running_cancellation_reaches_cancelled(self):
+        marker_path = self.temp_root / "local-cancelled.jsonl"
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-cancelled",
+            sleep_seconds=5.0,
+            side_effect_path=marker_path,
+        )
+        agent_run = self.create_queued_run()
+
+        def request_cancellation_after_process_start(run_id):
+            """
+            Request cancellation through authoritative AgentRun state while running.
+            """
+
+            if marker_path.exists():
+                request_agent_run_cancellation(run_id)
+
+            return is_agent_run_cancellation_requested(run_id)
+
+        with (
+            self.settings(
+                AGENT_EXECUTOR_BACKEND="local_subprocess",
+                AGENT_CODEX_EXECUTABLE=str(executable_path),
+                AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+                AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.05,
+                AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+            ),
+            patch(
+                "apps.agent_workspace.services.execution_service."
+                "is_agent_run_cancellation_requested",
+                side_effect=request_cancellation_after_process_start,
+            ),
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        self.assertEqual(executed_run.status, AgentRunStatus.CANCELLED.value)
+        self.assertIsNotNone(executed_run.cancel_requested_at)
+        self.assertTrue(marker_path.exists())
+        self.assertFalse(self.workspace_manager.get_workspace_path(agent_run.id).exists())
+
+    def test_local_subprocess_pre_spawn_cancellation_does_not_start_process(self):
+        marker_path = self.temp_root / "local-pre-spawn-cancelled.jsonl"
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-pre-spawn-cancelled",
+            side_effect_path=marker_path,
+        )
+        agent_run = self.create_queued_run()
+
+        def request_cancellation_before_spawn(run_id):
+            """
+            Request cancellation during the executor's pre-spawn cancellation check.
+            """
+
+            request_agent_run_cancellation(run_id)
+
+            return True
+
+        with (
+            self.settings(
+                AGENT_EXECUTOR_BACKEND="local_subprocess",
+                AGENT_CODEX_EXECUTABLE=str(executable_path),
+                AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+                AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.05,
+                AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+            ),
+            patch(
+                "apps.agent_workspace.services.execution_service."
+                "is_agent_run_cancellation_requested",
+                side_effect=request_cancellation_before_spawn,
+            ),
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        self.assertEqual(executed_run.status, AgentRunStatus.CANCELLED.value)
+        self.assertFalse(marker_path.exists())
+        self.assertFalse(self.workspace_manager.get_workspace_path(agent_run.id).exists())
+
+    def test_local_subprocess_spawn_failure_reaches_failed_and_cleans_workspace(self):
+        missing_executable_path = self.fake_bin_path / "missing-codex"
+        agent_run = self.create_queued_run()
+
+        with self.settings(
+            AGENT_EXECUTOR_BACKEND="local_subprocess",
+            AGENT_CODEX_EXECUTABLE=str(missing_executable_path),
+            AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+            AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.05,
+            AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+        ):
+            with self.assertRaises(AgentProcessSpawnError):
+                execute_agent_run_lifecycle(agent_run.id)
+
+        agent_run.refresh_from_db()
+        self.assertEqual(agent_run.status, AgentRunStatus.FAILED.value)
+        self.assertIsNotNone(agent_run.finished_at)
+        self.assertFalse(self.workspace_manager.get_workspace_path(agent_run.id).exists())
+
+    def test_local_subprocess_duplicate_delivery_does_not_start_process_twice(self):
+        marker_path = self.temp_root / "local-duplicate.jsonl"
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-duplicate",
+            side_effect_path=marker_path,
+        )
+        agent_run = self.create_queued_run()
+
+        with self.settings(
+            AGENT_EXECUTOR_BACKEND="local_subprocess",
+            AGENT_CODEX_EXECUTABLE=str(executable_path),
+            AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+            AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.05,
+            AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+        ):
+            first_result = execute_agent_run_lifecycle(agent_run.id)
+            second_result = execute_agent_run_lifecycle(agent_run.id)
+
+        marker_lines = marker_path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(first_result.status, AgentRunStatus.SUCCEEDED.value)
+        self.assertIsNone(second_result)
+        self.assertEqual(len(marker_lines), 1)
+
+    def test_local_backend_persists_context_before_executor_starts(self):
+        agent_run = self.create_queued_run()
+
+        def assert_context_before_execute(executor, request, *, is_cancel_requested=None):
+            """
+            Verify context audit metadata is persisted before AgentExecutor starts.
+            """
+
+            persisted_run = AgentRun.objects.get(id=request.run_id)
+            self.assertEqual(persisted_run.context_version, "execution-context-v1")
+            self.assertIsNotNone(persisted_run.context_hash)
+            self.assertTrue(request.workspace_path.exists())
+            self.assertIsNotNone(is_cancel_requested)
+
+            return AgentExecutionResult(
+                outcome=AgentExecutionOutcome.SUCCEEDED,
+                exit_code=0,
+            )
+
+        with (
+            self.settings(
+                AGENT_EXECUTOR_BACKEND="local_subprocess",
+                AGENT_CODEX_EXECUTABLE="unused-codex",
+            ),
+            patch(
+                "apps.agent_workspace.services.execution_service.LocalSubprocessExecutor.execute",
+                autospec=True,
+                side_effect=assert_context_before_execute,
+            ) as execute,
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        self.assertEqual(executed_run.status, AgentRunStatus.SUCCEEDED.value)
+        execute.assert_called_once()
+
+    def test_local_subprocess_terminal_state_is_persisted_before_cleanup(self):
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-terminal-before-cleanup",
+        )
+        agent_run = self.create_queued_run()
+
+        def assert_succeeded_before_cleanup(run_id):
+            """
+            Verify local subprocess terminal state is persisted before cleanup.
+            """
+
+            persisted_run = AgentRun.objects.get(id=run_id)
+            self.assertEqual(persisted_run.status, AgentRunStatus.SUCCEEDED.value)
+            self.assertIsNotNone(persisted_run.finished_at)
+
+        with (
+            self.settings(
+                AGENT_EXECUTOR_BACKEND="local_subprocess",
+                AGENT_CODEX_EXECUTABLE=str(executable_path),
+                AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+                AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.05,
+                AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+            ),
+            patch.object(
+                self.workspace_manager,
+                "cleanup_workspace",
+                side_effect=assert_succeeded_before_cleanup,
+            ),
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        self.assertEqual(executed_run.status, AgentRunStatus.SUCCEEDED.value)
+
+    def test_local_subprocess_cleanup_failure_does_not_rewrite_succeeded(self):
+        executable_path = self.create_agent_lifecycle_executable(
+            executable_name="fake-local-cleanup-failure",
+        )
+        agent_run = self.create_queued_run()
+
+        with (
+            self.settings(
+                AGENT_EXECUTOR_BACKEND="local_subprocess",
+                AGENT_CODEX_EXECUTABLE=str(executable_path),
+                AGENT_EXECUTION_TIMEOUT_SECONDS=2.0,
+                AGENT_EXECUTION_TERMINATION_GRACE_SECONDS=0.05,
+                AGENT_EXECUTION_CANCELLATION_POLL_SECONDS=0.02,
+            ),
+            patch.object(
+                self.workspace_manager,
+                "cleanup_workspace",
+                side_effect=RuntimeError("Cleanup failed"),
+            ),
+            self.assertLogs(
+                "apps.agent_workspace.services.execution_service",
+                level="ERROR",
+            ),
+        ):
+            executed_run = execute_agent_run_lifecycle(agent_run.id)
+
+        agent_run.refresh_from_db()
+        self.assertEqual(executed_run.status, AgentRunStatus.SUCCEEDED.value)
+        self.assertEqual(agent_run.status, AgentRunStatus.SUCCEEDED.value)
+
+    @override_settings(AGENT_EXECUTOR_BACKEND="unexpected")
+    def test_invalid_executor_backend_fails_clearly_after_claim(self):
+        agent_run = self.create_queued_run()
+
+        with self.assertRaises(AgentExecutionError):
+            execute_agent_run_lifecycle(agent_run.id)
+
+        agent_run.refresh_from_db()
+        self.assertEqual(agent_run.status, AgentRunStatus.FAILED.value)
+        self.assertFalse(self.workspace_manager.get_workspace_path(agent_run.id).exists())
 
 
 class AgentRunPostCommitDispatchTests(TransactionTestCase):
