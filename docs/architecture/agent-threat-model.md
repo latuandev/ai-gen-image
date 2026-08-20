@@ -167,7 +167,10 @@ Spawn child process and allow parent Codex process to exit.
 
 Expected control:
 
-Executor manages the complete process tree/runtime lifecycle.
+Production runtime containment manages the complete process tree/runtime
+lifecycle. `LocalSubprocessExecutor` is a trusted development executor and only
+guarantees cleanup for the direct process and live descendants that remain in
+its executor-owned process group.
 
 ---
 

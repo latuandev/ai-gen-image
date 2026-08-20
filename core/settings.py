@@ -13,7 +13,9 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 import os
 from pathlib import Path
 
-from common.utils.helpers import agent_workspace_root_from_env, env_bool, env_list
+from django.core.exceptions import ImproperlyConfigured
+
+from common.utils.helpers import agent_workspace_root_from_env, env_bool, env_float, env_list
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -158,6 +160,34 @@ CELERY_TIMEZONE = TIME_ZONE
 # Agent workspace
 
 AGENT_WORKSPACE_ROOT = agent_workspace_root_from_env()
+AGENT_EXECUTOR_BACKEND = os.getenv("AGENT_EXECUTOR_BACKEND", "dummy").strip()
+AGENT_CODEX_EXECUTABLE = os.getenv("AGENT_CODEX_EXECUTABLE", "codex").strip()
+AGENT_EXECUTION_TIMEOUT_SECONDS = env_float("AGENT_EXECUTION_TIMEOUT_SECONDS", 300.0)
+AGENT_EXECUTION_TERMINATION_GRACE_SECONDS = env_float(
+    "AGENT_EXECUTION_TERMINATION_GRACE_SECONDS",
+    5.0,
+)
+AGENT_EXECUTION_CANCELLATION_POLL_SECONDS = env_float(
+    "AGENT_EXECUTION_CANCELLATION_POLL_SECONDS",
+    0.5,
+)
+
+if AGENT_EXECUTION_TIMEOUT_SECONDS <= 0:
+    raise ImproperlyConfigured("AGENT_EXECUTION_TIMEOUT_SECONDS must be greater than 0.")
+
+if AGENT_EXECUTION_TERMINATION_GRACE_SECONDS < 0:
+    raise ImproperlyConfigured(
+        "AGENT_EXECUTION_TERMINATION_GRACE_SECONDS must be greater than or equal to 0."
+    )
+
+if AGENT_EXECUTION_CANCELLATION_POLL_SECONDS <= 0:
+    raise ImproperlyConfigured("AGENT_EXECUTION_CANCELLATION_POLL_SECONDS must be greater than 0.")
+
+if AGENT_EXECUTOR_BACKEND not in {"dummy", "local_subprocess"}:
+    raise ImproperlyConfigured("AGENT_EXECUTOR_BACKEND must be dummy or local_subprocess.")
+
+if not AGENT_CODEX_EXECUTABLE:
+    raise ImproperlyConfigured("AGENT_CODEX_EXECUTABLE cannot be blank.")
 
 
 # Email

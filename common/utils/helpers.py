@@ -1,5 +1,6 @@
 import os
 import tempfile
+from math import isfinite
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -29,6 +30,27 @@ def env_list(name: str, default: str = ""):
     value = os.getenv(name, default)
 
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def env_float(name: str, default: float) -> float:
+    """
+    Get an environment variable and convert it to a finite float.
+    """
+
+    value = os.getenv(name)
+
+    if value is None or value.strip() == "":
+        return default
+
+    try:
+        parsed_value = float(value)
+    except ValueError as exc:
+        raise ImproperlyConfigured(f"{name} must be a finite number.") from exc
+
+    if not isfinite(parsed_value):
+        raise ImproperlyConfigured(f"{name} must be a finite number.")
+
+    return parsed_value
 
 
 def default_agent_workspace_root() -> Path:

@@ -30,6 +30,51 @@ class AgentExecutionError(Exception):
     """
 
 
+class AgentProcessSpawnError(AgentExecutionError):
+    """
+    Signal that an Agent subprocess could not be started or prepared safely.
+    """
+
+    def __init__(self, reason: str):
+        """
+        Store the spawn failure reason in a deterministic message.
+        """
+
+        self.reason = reason
+
+        super().__init__(f"Agent process spawn error: {reason}.")
+
+
+class InvalidAgentExecutorConfiguration(Exception):
+    """
+    Signal that Agent executor runtime configuration is invalid.
+    """
+
+    def __init__(self, reason: str):
+        """
+        Store the configuration failure reason in a deterministic message.
+        """
+
+        self.reason = reason
+
+        super().__init__(f"Invalid Agent executor configuration: {reason}.")
+
+
+class InvalidCodexCLIConfiguration(Exception):
+    """
+    Signal that Codex CLI invocation configuration is invalid.
+    """
+
+    def __init__(self, reason: str):
+        """
+        Store the configuration failure reason in a deterministic message.
+        """
+
+        self.reason = reason
+
+        super().__init__(f"Invalid Codex CLI configuration: {reason}.")
+
+
 class InvalidContextManifest(Exception):
     """
     Signal that the end-user context manifest is invalid or unsafe.
