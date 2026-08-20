@@ -310,13 +310,48 @@ class CodexCLIWrapperTests(TestCase):
         self.assertNotIn(prompt, metacharacter_invocation.argv)
 
     def test_invocation_is_non_interactive(self):
-        invocation = CodexCLIWrapper().build_invocation(self.create_request())
+        workspace_path = Path("/tmp/agent-workspaces/non-interactive")
+        invocation = CodexCLIWrapper().build_invocation(
+            self.create_request(workspace_path=workspace_path)
+        )
 
-        self.assertIn("exec", invocation.argv)
         self.assertEqual(
-            invocation.argv[invocation.argv.index("--ask-for-approval") + 1],
+            invocation.argv,
+            (
+                "codex",
+                "--ask-for-approval",
+                "never",
+                "exec",
+                "--cd",
+                str(workspace_path),
+                "--skip-git-repo-check",
+                "--sandbox",
+                "workspace-write",
+                "--color",
+                "never",
+                "--json",
+                "-",
+            ),
+        )
+        self.assertIn("exec", invocation.argv)
+        exec_index = invocation.argv.index("exec")
+        approval_index = invocation.argv.index("--ask-for-approval")
+
+        self.assertLess(approval_index, exec_index)
+        self.assertEqual(
+            invocation.argv[approval_index + 1],
             "never",
         )
+        for exec_option in (
+            "--cd",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "--color",
+            "--json",
+        ):
+            with self.subTest(exec_option=exec_option):
+                self.assertLess(exec_index, invocation.argv.index(exec_option))
+
         self.assertIn("--json", invocation.argv)
         self.assertEqual(
             invocation.argv[invocation.argv.index("--color") + 1],

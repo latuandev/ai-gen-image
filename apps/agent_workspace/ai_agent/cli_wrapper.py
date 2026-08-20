@@ -78,14 +78,14 @@ class CodexCLIWrapper:
         codex_home = workspace_path / CODEX_WORKSPACE_CONFIG_DIRECTORY
         argv = (
             self.executable,
+            "--ask-for-approval",
+            "never",
             "exec",
             "--cd",
             str(workspace_path),
             "--skip-git-repo-check",
             "--sandbox",
             "workspace-write",
-            "--ask-for-approval",
-            "never",
             "--color",
             "never",
             "--json",
